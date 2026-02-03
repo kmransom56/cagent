@@ -1,0 +1,5 @@
+# This directory is a Syncthing folder marker.
+# Do not delete.
+
+folderID: cagent
+created: 2026-01-19T20:11:08-05:00

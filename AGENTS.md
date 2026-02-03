@@ -309,6 +309,37 @@ agents:
 - `TELEMETRY_ENABLED` - Control telemetry (set to false to disable)
 - `CAGENT_HIDE_TELEMETRY_BANNER` - Hide telemetry banner message
 
+## Port Allocation
+
+### Port Range Policy
+
+**IMPORTANT**: All new applications and services must use ports in the range **11000-12000**.
+
+- **Reserved Range**: 11000-12000 for all new applications
+- **Purpose**: Avoid conflicts with common development ports (3000, 8080, etc.)
+- **Allocation**: Choose an available port within this range
+- **Documentation**: Document port assignments in project README or configuration
+
+**Examples:**
+- Chat Copilot Frontend: 11000
+- Chat Copilot Backend: 11001
+- Custom API Server: 11002
+- Development Tools: 11003+
+
+**Port Checking:**
+```powershell
+# Check if port is available
+Test-NetConnection -ComputerName localhost -Port 11000 -InformationLevel Quiet
+
+# Find available port in range
+$port = 11000
+while ($port -le 12000) {
+    $available = -not (Test-NetConnection -ComputerName localhost -Port $port -InformationLevel Quiet -WarningAction SilentlyContinue)
+    if ($available) { break }
+    $port++
+}
+```
+
 ## Debugging and Troubleshooting
 
 ### Debug Mode

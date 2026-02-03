@@ -53,21 +53,75 @@ if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
 # Step 2: Install .NET 8 SDK
 Write-Host ""
 Write-Host "[2/6] Checking .NET 8 SDK..." -ForegroundColor Green
-$dotnetVersion = dotnet --version 2>$null
-if ($null -eq $dotnetVersion) {
+$dotnetVersion = $null
+try {
+    $dotnetVersion = (Get-Command dotnet -ErrorAction Stop).Version.ToString() 2>$null
+} catch {
+    # Try to find dotnet in common locations
+    $dotnetPaths = @(
+        "${env:ProgramFiles}\dotnet\dotnet.exe",
+        "${env:ProgramFiles(x86)}\dotnet\dotnet.exe",
+        "$env:USERPROFILE\.dotnet\dotnet.exe"
+    )
+    foreach ($path in $dotnetPaths) {
+        if (Test-Path $path) {
+            $dotnetVersion = & $path --version 2>$null
+            if ($dotnetVersion) { break }
+        }
+    }
+}
+
+if ($null -eq $dotnetVersion -or $dotnetVersion -eq "") {
     Write-Host "Installing .NET 8 SDK..." -ForegroundColor Yellow
-    choco install dotnet-sdk -y --version=8.0
-    Write-Host "✓ .NET 8 SDK installed successfully" -ForegroundColor Green
-    $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH","User")
-    dotnet --version
+    choco install dotnet-8.0-sdk -y 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "✓ .NET 8 SDK installed successfully" -ForegroundColor Green
+        # Refresh PATH from registry
+        $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH","User")
+        # Try to find dotnet after installation
+        Start-Sleep -Seconds 2
+        $dotnetPaths = @(
+            "${env:ProgramFiles}\dotnet\dotnet.exe",
+            "${env:ProgramFiles(x86)}\dotnet\dotnet.exe"
+        )
+        foreach ($path in $dotnetPaths) {
+            if (Test-Path $path) {
+                $dotnetVersion = & $path --version 2>$null
+                if ($dotnetVersion) {
+                    Write-Host "  Installed version: $dotnetVersion" -ForegroundColor Cyan
+                    break
+                }
+            }
+        }
+    } else {
+        Write-Host "⚠ .NET 8 SDK installation may have failed. Check Chocolatey logs." -ForegroundColor Yellow
+        Write-Host "  You may need to install manually from: https://dotnet.microsoft.com/download/dotnet/8.0" -ForegroundColor Yellow
+    }
 } else {
     Write-Host "✓ .NET already installed (version $dotnetVersion)" -ForegroundColor Green
 }
 
-# Verify required .NET workloads
-Write-Host "Installing .NET workloads..." -ForegroundColor Yellow
-dotnet workload restore 2>$null
-Write-Host "✓ .NET workloads ready" -ForegroundColor Green
+# Verify required .NET workloads (only if dotnet is available)
+if ($dotnetVersion) {
+    Write-Host "Installing .NET workloads..." -ForegroundColor Yellow
+    $dotnetCmd = (Get-Command dotnet -ErrorAction SilentlyContinue).Source
+    if (-not $dotnetCmd) {
+        $dotnetPaths = @(
+            "${env:ProgramFiles}\dotnet\dotnet.exe",
+            "${env:ProgramFiles(x86)}\dotnet\dotnet.exe"
+        )
+        foreach ($path in $dotnetPaths) {
+            if (Test-Path $path) {
+                $dotnetCmd = $path
+                break
+            }
+        }
+    }
+    if ($dotnetCmd) {
+        & $dotnetCmd workload restore 2>$null
+        Write-Host "✓ .NET workloads ready" -ForegroundColor Green
+    }
+}
 
 # Step 3: Install Node.js
 Write-Host ""
@@ -86,17 +140,47 @@ if ($null -eq $nodeVersion) {
 # Step 4: Install Yarn
 Write-Host ""
 Write-Host "[4/6] Checking Yarn..." -ForegroundColor Green
-$yarnVersion = yarn --version 2>$null
-if ($null -eq $yarnVersion) {
+$yarnVersion = $null
+try {
+    $yarnVersion = yarn --version 2>$null
+} catch {
+    # Yarn not found
+}
+
+if ($null -eq $yarnVersion -or $yarnVersion -eq "") {
     Write-Host "Installing Yarn (Classic)..." -ForegroundColor Yellow
-    npm install -g yarn
-    yarn set version classic
-    Write-Host "✓ Yarn installed successfully" -ForegroundColor Green
-    yarn --version
+    try {
+        npm install -g yarn --loglevel=error 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            # Refresh PATH
+            $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH","User")
+            Start-Sleep -Seconds 1
+            try {
+                yarn set version classic 2>&1 | Out-Null
+                $yarnVersion = yarn --version 2>$null
+                if ($yarnVersion) {
+                    Write-Host "✓ Yarn installed successfully (version $yarnVersion)" -ForegroundColor Green
+                } else {
+                    Write-Host "⚠ Yarn installed but version check failed" -ForegroundColor Yellow
+                }
+            } catch {
+                Write-Host "⚠ Yarn installed but classic version setup had issues" -ForegroundColor Yellow
+                Write-Host "  You may need to run: yarn set version classic" -ForegroundColor Gray
+            }
+        } else {
+            Write-Host "⚠ Yarn installation may have failed" -ForegroundColor Yellow
+        }
+    } catch {
+        Write-Host "⚠ Failed to install Yarn: $_" -ForegroundColor Yellow
+    }
 } else {
     Write-Host "✓ Yarn already installed (version $yarnVersion)" -ForegroundColor Green
     # Ensure classic version
-    yarn set version classic 2>$null
+    try {
+        yarn set version classic 2>&1 | Out-Null
+    } catch {
+        # Ignore errors if already classic
+    }
 }
 
 # Step 5: Install Git (if not already installed)
@@ -134,18 +218,46 @@ if ($null -eq $dockerVersion) {
 if ($VSCodeExtensions) {
     Write-Host ""
     Write-Host "[Optional] Installing VS Code Extensions..." -ForegroundColor Green
-    $codeCmd = code 2>$null
+    $codeCmd = $null
+    try {
+        $codeCmd = Get-Command code -ErrorAction Stop
+    } catch {
+        # Check common VS Code installation paths
+        $codePaths = @(
+            "${env:ProgramFiles}\Microsoft VS Code\bin\code.cmd",
+            "${env:ProgramFiles(x86)}\Microsoft VS Code\bin\code.cmd",
+            "${env:LOCALAPPDATA}\Programs\Microsoft VS Code\bin\code.cmd",
+            "$env:USERPROFILE\AppData\Local\Programs\Microsoft VS Code\bin\code.cmd"
+        )
+        foreach ($path in $codePaths) {
+            if (Test-Path $path) {
+                $codeCmd = $path
+                break
+            }
+        }
+    }
+    
     if ($null -ne $codeCmd) {
         Write-Host "Installing recommended extensions..." -ForegroundColor Yellow
-        code --install-extension ms-dotnettools.csharp
-        code --install-extension ms-dotnettools.vscode-dotnet-runtime
-        code --install-extension ms-python.python
-        code --install-extension ms-vscode.makefile-tools
-        code --install-extension eamodio.gitlens
-        code --install-extension ms-vscode-remote.remote-wsl
+        if ($codeCmd -is [string]) {
+            & $codeCmd --install-extension ms-dotnettools.csharp 2>&1 | Out-Null
+            & $codeCmd --install-extension ms-dotnettools.vscode-dotnet-runtime 2>&1 | Out-Null
+            & $codeCmd --install-extension ms-python.python 2>&1 | Out-Null
+            & $codeCmd --install-extension ms-vscode.makefile-tools 2>&1 | Out-Null
+            & $codeCmd --install-extension eamodio.gitlens 2>&1 | Out-Null
+            & $codeCmd --install-extension ms-vscode-remote.remote-wsl 2>&1 | Out-Null
+        } else {
+            code --install-extension ms-dotnettools.csharp 2>&1 | Out-Null
+            code --install-extension ms-dotnettools.vscode-dotnet-runtime 2>&1 | Out-Null
+            code --install-extension ms-python.python 2>&1 | Out-Null
+            code --install-extension ms-vscode.makefile-tools 2>&1 | Out-Null
+            code --install-extension eamodio.gitlens 2>&1 | Out-Null
+            code --install-extension ms-vscode-remote.remote-wsl 2>&1 | Out-Null
+        }
         Write-Host "✓ VS Code extensions installed" -ForegroundColor Green
     } else {
         Write-Host "⊘ VS Code not found or not in PATH. Skipping extensions." -ForegroundColor Yellow
+        Write-Host "  Install VS Code from: https://code.visualstudio.com/" -ForegroundColor Gray
     }
 }
 
@@ -157,9 +269,39 @@ Write-Host "╚═════════════════════�
 
 Write-Host ""
 Write-Host "Installed versions:" -ForegroundColor Green
-Write-Host "  .NET SDK:    $(dotnet --version)" -ForegroundColor White
+# Safely get versions with error handling
+$dotnetVer = "Not installed"
+try {
+    $dotnetCmd = (Get-Command dotnet -ErrorAction SilentlyContinue).Source
+    if (-not $dotnetCmd) {
+        $dotnetPaths = @(
+            "${env:ProgramFiles}\dotnet\dotnet.exe",
+            "${env:ProgramFiles(x86)}\dotnet\dotnet.exe"
+        )
+        foreach ($path in $dotnetPaths) {
+            if (Test-Path $path) {
+                $dotnetCmd = $path
+                break
+            }
+        }
+    }
+    if ($dotnetCmd) {
+        $dotnetVer = & $dotnetCmd --version 2>$null
+    }
+} catch {
+    $dotnetVer = "Not found"
+}
+
+$yarnVer = "Not installed"
+try {
+    $yarnVer = yarn --version 2>$null
+} catch {
+    $yarnVer = "Not found"
+}
+
+Write-Host "  .NET SDK:    $dotnetVer" -ForegroundColor White
 Write-Host "  Node.js:     $(node --version)" -ForegroundColor White
-Write-Host "  Yarn:        $(yarn --version)" -ForegroundColor White
+Write-Host "  Yarn:        $yarnVer" -ForegroundColor White
 Write-Host "  Git:         $(git --version)" -ForegroundColor White
 if ($null -ne $dockerVersion) {
     Write-Host "  Docker:      $(docker --version)" -ForegroundColor White
@@ -194,12 +336,11 @@ if (-not $SkipDocker) {
 }
 
 Write-Host "✓ Setup complete! Your development environment is ready." -ForegroundColor Green
-
 # SIG # Begin signature block
 # MIIFsAYJKoZIhvcNAQcCoIIFoTCCBZ0CAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCA6Og/RWzUZIWXx
-# M1axCeuIm9QNnzVq4CBcBGQmyh7AeaCCAxwwggMYMIICAKADAgECAhAucOo6j/Tz
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCC+X8gyrM/SdJdg
+# iANw8JlZB5rtixd4EPRqiQeKfCcjOqCCAxwwggMYMIICAKADAgECAhAucOo6j/Tz
 # gURLf5KSeLjZMA0GCSqGSIb3DQEBCwUAMCQxIjAgBgNVBAMMGUtlaXRoIFJhbnNv
 # bSBDb2RlIFNpZ25pbmcwHhcNMjUxMjIyMjMzNzMyWhcNMzAxMjIyMjM0NzMyWjAk
 # MSIwIAYDVQQDDBlLZWl0aCBSYW5zb20gQ29kZSBTaWduaW5nMIIBIjANBgkqhkiG
@@ -220,11 +361,11 @@ Write-Host "✓ Setup complete! Your development environment is ready." -Foregro
 # ZSBTaWduaW5nAhAucOo6j/TzgURLf5KSeLjZMA0GCWCGSAFlAwQCAQUAoIGEMBgG
 # CisGAQQBgjcCAQwxCjAIoAKAAKECgAAwGQYJKoZIhvcNAQkDMQwGCisGAQQBgjcC
 # AQQwHAYKKwYBBAGCNwIBCzEOMAwGCisGAQQBgjcCARUwLwYJKoZIhvcNAQkEMSIE
-# IJhjUXkF+36ZqaSkKp++y+BoPqu5zBOiPzTx4Q+9Tef3MA0GCSqGSIb3DQEBAQUA
-# BIIBAB65GKcMmZ66bE+KM462aUMJ+P+WCXlFxRpEqEpRdUFNeTUaYDPOWqJxFBgl
-# 7sRai0ZHoC/KtKSCs9X+u5ibLm4EE5HW3IzXyKjb2K/o8fivBe4iAKgii+wvPeBi
-# CiMOFp0FF73ds9uiFx2fTpNlmbyPWFxsOYoNR+X8kBrr5UqVzTyYYIpWgdtjwx6v
-# XS0k+Whidh+bmDkNrP0rBXk48feQF+ae4UzQUQDigXl/7RHN0rfQ09p3TvpZACr9
-# VSD8rJuX0REw9+bE75FNr+xKwDqG37p5bDWjdX3ClDCFKMPKtuFu79PtwsTcXszM
-# EWY3roc84lOJBlafLu4Na9gQ+8I=
+# ILWBrfmuYhejT13ntWouVuSZOvN0aX+JEloORfAiiGVhMA0GCSqGSIb3DQEBAQUA
+# BIIBAJenzso9gMHO0ri4xRwFmu7p50/kt2vSBwjn4n+ZkiiUZhMSNr0TbhzDxz7A
+# /WQYm+EqzOcu/kCQddTWA3il9QF/U+3y4Orrefms4T1AT2/DKJjFFgUnx0nX6mLP
+# DEhQnKJ12bJ478OilTqYsZdzvJhSjB9/TA5NcfzHIa0RgAGBgY/XOnoI41QXW4yJ
+# f2A4N+hUu5+vF4LfHFu8slutoR6gbCeVFLCQYCaPi9pY8zN8gh/79pk6i5bBE/1p
+# XeeseZGJT6cRodQ7Htb7Zwodbf75Jl8WwmI6zLoCP/lvV85C+7myBcC65IvGIvKZ
+# mWj7XQRvT/kstO8x+Bo0EUq4jiM=
 # SIG # End signature block

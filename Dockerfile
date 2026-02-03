@@ -1,49 +1,45 @@
-# syntax=docker/dockerfile:1
+# Simplified Dockerfile for cagent
 
-# xx is a helper for cross-compilation
-FROM --platform=$BUILDPLATFORM tonistiigi/xx:1.7.0 AS xx
+FROM golang:1.24-alpine AS builder
 
-FROM --platform=$BUILDPLATFORM golang:1.25.3-alpine3.22 AS builder-base
-COPY --from=xx / /
 WORKDIR /src
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=bind,source=go.mod,target=go.mod \
-    --mount=type=bind,source=go.sum,target=go.sum \
-    go mod download
 
-FROM builder-base AS builder
-COPY . ./
-ARG GIT_TAG
-ARG GIT_COMMIT
-ARG TARGETPLATFORM
-ARG TARGETOS
-ARG TARGETARCH
-RUN --mount=type=cache,target=/root/.cache,id=docker-ai-$TARGETPLATFORM \
-    --mount=type=cache,target=/go/pkg/mod <<EOT
-    set -ex
-    xx-go build -trimpath -ldflags "-s -w -X 'github.com/docker/cagent/pkg/version.Version=$GIT_TAG' -X 'github.com/docker/cagent/pkg/version.Commit=$GIT_COMMIT'" -o /binaries/cagent-$TARGETOS-$TARGETARCH .
-    xx-verify --static /binaries/cagent-$TARGETOS-$TARGETARCH
-    if [ "$TARGETOS" = "windows" ]; then
-      mv /binaries/cagent-$TARGETOS-$TARGETARCH /binaries/cagent-$TARGETOS-$TARGETARCH.exe
-    fi
-EOT
+# Install build tools if necessary (git often needed for go mod)
+RUN apk add --no-cache git
 
-FROM scratch AS local
-ARG TARGETOS TARGETARCH
-COPY --from=builder /binaries/cagent-$TARGETOS-$TARGETARCH cagent
+# Copy dependencies
+COPY go.mod go.sum ./
+RUN go mod download
 
-FROM scratch AS cross
-COPY --from=builder /binaries .
+# Copy source
+COPY . .
 
-FROM alpine
+# Build for local architecture (no cross-compilation complexity)
+# Disable CGO for static binary
+RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /app/cagent .
+
+# Final stage
+FROM alpine:latest
+
+# Runtime dependencies
 RUN apk add --no-cache ca-certificates docker-cli
+
+# Setup user
 RUN addgroup -S cagent && adduser -S -G cagent cagent
-ARG TARGETOS TARGETARCH
+
 ENV DOCKER_MCP_IN_CONTAINER=1
 ENV TERM=xterm-256color
-RUN mkdir /data /work && chmod 777 /data /work
+
+# Setup directories
+RUN mkdir -p /data /work && \
+    chmod 777 /data /work
+
+# Copy mcp-gateway (assuming public image)
 COPY --from=docker/mcp-gateway:v2 /docker-mcp /usr/local/lib/docker/cli-plugins/
-COPY --from=builder /binaries/cagent-$TARGETOS-$TARGETARCH /cagent
+
+# Copy binary
+COPY --from=builder /app/cagent /cagent
+
 USER cagent
 WORKDIR /work
 ENTRYPOINT ["/cagent"]
