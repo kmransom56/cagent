@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# Simplified Dockerfile for cagent
 
 ARG GO_VERSION="1.26.1"
 ARG ALPINE_VERSION="3.22"
@@ -47,8 +47,8 @@ FROM scratch AS local
 ARG TARGETOS TARGETARCH
 COPY --from=builder /binaries/docker-agent-$TARGETOS-$TARGETARCH* docker-agent
 
-FROM scratch AS cross
-COPY --from=builder /binaries .
+# Copy source
+COPY . .
 
 FROM alpine:${ALPINE_VERSION}
 RUN apk add --no-cache ca-certificates docker-cli && \

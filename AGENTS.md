@@ -53,3 +53,232 @@
 - Older config types are frozen.
 - When adding new features to the config, update ./agent-schema.json accordingly and create an example yaml
   that demonstrates the new feature.
+
+This project uses `github.com/stretchr/testify` for assertions.
+
+In Go tests, always prefer `require` and `assert` from the `testify` package over manual error handling.
+
+### Configuration Validation
+
+- All agent references must exist in config
+- Model references can be inline (e.g., `openai/gpt-4o`) or defined in models section
+- Tool configurations validated at startup
+
+### Adding New Features
+
+- Follow existing patterns in `pkg/` directories
+- Implement proper interfaces for providers and tools
+- Add configuration support if needed
+- Consider both CLI and TUI interface impacts, along with API server impacts
+
+## Model Provider Configuration Examples
+
+Models can be referenced inline (e.g., `openai/gpt-4o`) or defined explicitly:
+
+### OpenAI
+
+```yaml
+models:
+  gpt4:
+    provider: openai
+    model: gpt-4o
+    temperature: 0.7
+    max_tokens: 4000
+```
+
+### Anthropic
+
+```yaml
+models:
+  claude:
+    provider: anthropic
+    model: claude-sonnet-4-0
+    max_tokens: 64000
+```
+
+### Gemini
+
+```yaml
+models:
+  gemini:
+    provider: google
+    model: gemini-2.0-flash
+    temperature: 0.5
+```
+
+### DMR
+
+```yaml
+models:
+  dmr:
+    provider: dmr
+    model: ai/llama3.2
+```
+
+## Tool Configuration Examples
+
+### Local MCP Server (stdio)
+
+```yaml
+toolsets:
+  - type: mcp
+    command: "python"
+    args: ["-m", "mcp_server"]
+    tools: ["specific_tool"] # optional filtering
+    env:
+      API_KEY: "value"
+```
+
+### Remote MCP Server (SSE)
+
+```yaml
+toolsets:
+  - type: mcp
+    remote:
+      url: "http://localhost:8080/mcp"
+      transport_type: "sse"
+      headers:
+        Authorization: "Bearer token"
+```
+
+### Docker-based MCP Server
+
+```yaml
+toolsets:
+  - type: mcp
+    ref: docker:github-official
+    instruction: |
+      Use these tools to help with GitHub tasks.
+```
+
+### Memory Tool with Custom Path
+
+```yaml
+toolsets:
+  - type: memory
+    path: "./agent_memory.db"
+```
+
+### Shell Tool
+
+```yaml
+toolsets:
+  - type: shell
+```
+
+### Filesystem Tool
+
+```yaml
+toolsets:
+  - type: filesystem
+```
+
+## Common Development Patterns
+
+### Agent Hierarchy Example
+
+```yaml
+agents:
+  root:
+    model: anthropic/claude-sonnet-4-0
+    description: "Main coordinator"
+    sub_agents: ["researcher", "writer"]
+    toolsets:
+      - type: transfer_task
+      - type: think
+
+  researcher:
+    model: openai/gpt-4o
+    description: "Research specialist"
+    toolsets:
+      - type: mcp
+        ref: docker:search-tools
+
+  writer:
+    model: anthropic/claude-sonnet-4-0
+    description: "Writing specialist"
+    toolsets:
+      - type: filesystem
+      - type: memory
+        path: ./writer_memory.db
+```
+
+### Session Commands During CLI Usage
+
+- `/new` - Clear session history
+- `/compact` - Generate summary and compact session history
+- `/copy` - Copy the current conversation to the clipboard
+- `/eval` - Save evaluation data
+
+## File Locations and Patterns
+
+### Key Package Structure
+
+- `pkg/agent/` - Core agent abstraction and management
+- `pkg/runtime/` - Event-driven execution engine
+- `pkg/tools/` - Built-in and MCP tool implementations
+- `pkg/model/provider/` - AI provider implementations
+- `pkg/session/` - Conversation state management
+- `pkg/config/` - YAML configuration parsing and validation
+- `pkg/gateway/` - MCP gateway/server implementation
+- `pkg/tui/` - Terminal User Interface components
+- `pkg/api/` - API server implementation
+
+### Configuration File Locations
+
+- `examples/` - Sample agent configurations
+- Root directory - Main project configurations (`Taskfile.yml`, `go.mod`)
+
+### Environment Variables
+
+- `OPENAI_API_KEY` - OpenAI authentication
+- `ANTHROPIC_API_KEY` - Anthropic authentication
+- `GOOGLE_API_KEY` - Google/Gemini authentication
+- `MISTRAL_API_KEY` - Mistral authentication
+- `TELEMETRY_ENABLED` - Control telemetry (set to false to disable)
+- `CAGENT_HIDE_TELEMETRY_BANNER` - Hide telemetry banner message
+
+## Port Allocation
+
+### Port Range Policy
+
+**IMPORTANT**: All new applications and services must use ports in the range **11000-12000**.
+
+- **Reserved Range**: 11000-12000 for all new applications
+- **Purpose**: Avoid conflicts with common development ports (3000, 8080, etc.)
+- **Allocation**: Choose an available port within this range
+- **Documentation**: Document port assignments in project README or configuration
+
+**Examples:**
+- Chat Copilot Frontend: 11000
+- Chat Copilot Backend: 11001
+- Custom API Server: 11002
+- Development Tools: 11003+
+
+**Port Checking:**
+```powershell
+# Check if port is available
+Test-NetConnection -ComputerName localhost -Port 11000 -InformationLevel Quiet
+
+# Find available port in range
+$port = 11000
+while ($port -le 12000) {
+    $available = -not (Test-NetConnection -ComputerName localhost -Port $port -InformationLevel Quiet -WarningAction SilentlyContinue)
+    if ($available) { break }
+    $port++
+}
+```
+
+## Debugging and Troubleshooting
+
+### Debug Mode
+
+- Add `--debug` flag to any command for detailed logging
+- Logs written to `~/.cagent/cagent.debug.log` by default
+- Use `--log-file <path>` to specify custom log location
+- Example: `./bin/cagent run config.yaml --debug`
+
+### OpenTelemetry Tracing
+
+- Add `--otel` flag to enable OpenTelemetry tracing
+- Example: `./bin/cagent run config.yaml --otel`
