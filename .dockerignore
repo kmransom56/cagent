@@ -4,3 +4,4 @@
 !./**/*.template
 !./**/*.go
 !./**/*.txt
+!ca_chain.crt

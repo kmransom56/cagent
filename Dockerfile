@@ -1,22 +1,31 @@
 # Simplified Dockerfile for cagent
 
-FROM golang:1.24-alpine AS builder
+FROM golang:1.25.3-alpine AS builder
 
 WORKDIR /src
 
 # Install build tools if necessary (git often needed for go mod)
-RUN apk add --no-cache git
+RUN apk add --no-cache git ca-certificates
+
+# Copy custom CA cert if present
+COPY ca_chain.crt /usr/local/share/ca-certificates/custom-ca.crt
+RUN update-ca-certificates
+
+# Environment settings for Go
+ENV GOPROXY=direct
+ENV GOSUMDB=off
 
 # Copy dependencies
 COPY go.mod go.sum ./
-RUN go mod download
+# Skipping explicit go mod download to see if go build works or gives better error
+# RUN go mod download
 
 # Copy source
 COPY . .
 
-# Build for local architecture (no cross-compilation complexity)
+# Build for local architecture
 # Disable CGO for static binary
-RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /app/cagent .
+RUN CGO_ENABLED=0 go build -v -trimpath -ldflags "-s -w" -o /app/cagent .
 
 # Final stage
 FROM alpine:latest
