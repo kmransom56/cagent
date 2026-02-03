@@ -1,53 +1,82 @@
 package oci
 
 import (
+	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/goccy/go-yaml"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/empty"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/static"
 	"github.com/google/go-containerregistry/pkg/v1/types"
 
+	"github.com/docker/cagent/pkg/config"
+	"github.com/docker/cagent/pkg/config/latest"
 	"github.com/docker/cagent/pkg/content"
-	"github.com/docker/cagent/pkg/path"
+	"github.com/docker/cagent/pkg/version"
 )
 
 // PackageFileAsOCIToStore creates an OCI artifact from a file and stores it in the content store
-func PackageFileAsOCIToStore(filePath, artifactRef string, store *content.Store) (string, error) {
+func PackageFileAsOCIToStore(ctx context.Context, agentSource config.Source, artifactRef string, store *content.Store) (string, error) {
 	if !strings.Contains(artifactRef, ":") {
 		artifactRef += ":latest"
 	}
 
-	// Validate the file path to prevent directory traversal attacks
-	validatedPath, err := path.ValidatePathInDirectory(filePath, "")
+	cfg, err := config.Load(ctx, agentSource)
 	if err != nil {
-		return "", fmt.Errorf("invalid file path: %w", err)
+		return "", fmt.Errorf("loading config: %w", err)
 	}
 
-	data, err := os.ReadFile(validatedPath)
+	// Read raw data
+	var raw struct {
+		Version string `yaml:"version,omitempty"`
+	}
+	data, err := agentSource.Read(ctx)
 	if err != nil {
 		return "", fmt.Errorf("reading file: %w", err)
 	}
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return "", fmt.Errorf("looking for version in config file\n%s", yaml.FormatError(err, true, true))
+	}
 
-	layer := static.NewLayer(data, types.OCIUncompressedLayer)
+	// Make sure we push a yaml with a version (Use latest if missing)
+	if raw.Version == "" {
+		cfg.Version = latest.Version
+		data, err = yaml.MarshalWithOptions(cfg, yaml.Indent(2))
+		if err != nil {
+			return "", fmt.Errorf("marshaling config: %w", err)
+		}
+	}
 
-	img := empty.Image
+	// Prepare OCI annotations
+	annotations := map[string]string{
+		"io.docker.cagent.version":             version.Version,
+		"org.opencontainers.image.created":     time.Now().Format(time.RFC3339),
+		"org.opencontainers.image.description": fmt.Sprintf("OCI artifact containing %s", filepath.Base(agentSource.Name())),
+	}
+	if author := cfg.Metadata.Author; author != "" {
+		annotations["org.opencontainers.image.authors"] = author
+	}
+	if license := cfg.Metadata.License; license != "" {
+		annotations["org.opencontainers.image.licenses"] = license
+	}
+	if revision := cfg.Metadata.Version; revision != "" {
+		annotations["org.opencontainers.image.revision"] = revision
+	}
 
-	img, err = mutate.AppendLayers(img, layer)
+	layer := static.NewLayer(data, "application/yaml")
+	img, err := mutate.AppendLayers(empty.Image, layer)
 	if err != nil {
 		return "", fmt.Errorf("appending layer: %w", err)
 	}
 
-	annotations := map[string]string{
-		"org.opencontainers.image.created":     time.Now().Format(time.RFC3339),
-		"org.opencontainers.image.description": fmt.Sprintf("OCI artifact containing %s", filepath.Base(validatedPath)),
-	}
-
+	// Convert to OCI manifest format to support annotations
+	img = mutate.MediaType(img, types.OCIManifestSchema1)
+	img = mutate.ConfigMediaType(img, "application/vnd.docker.cagent.config.v1+json")
 	img = mutate.Annotations(img, annotations).(v1.Image)
 
 	digest, err := store.StoreArtifact(img, artifactRef)

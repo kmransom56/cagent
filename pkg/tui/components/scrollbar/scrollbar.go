@@ -9,6 +9,9 @@ import (
 	"github.com/docker/cagent/pkg/tui/styles"
 )
 
+// Width is the intrinsic width of the scrollbar component in terminal columns.
+const Width = 1
+
 type Model struct {
 	totalHeight  int
 	viewHeight   int
@@ -30,9 +33,9 @@ type Model struct {
 
 func New() *Model {
 	return &Model{
-		width:     1,
+		width:     Width,
 		trackChar: "│",
-		thumbChar: "█",
+		thumbChar: "│",
 	}
 }
 
@@ -40,6 +43,8 @@ func (m *Model) SetDimensions(viewHeight, totalHeight int) {
 	m.viewHeight = viewHeight
 	m.height = viewHeight
 	m.totalHeight = totalHeight
+	// Clamp scroll offset to valid range after dimension change
+	m.scrollOffset = max(0, min(m.scrollOffset, m.maxScrollOffset()))
 }
 
 func (m *Model) SetScrollOffset(offset int) {
@@ -104,7 +109,11 @@ func (m *Model) View() string {
 		var char string
 
 		if i >= thumbTop && i < thumbTop+thumbHeight {
-			style = styles.ThumbStyle
+			if m.dragging {
+				style = styles.ThumbActiveStyle
+			} else {
+				style = styles.ThumbStyle
+			}
 			char = m.thumbChar
 		} else {
 			style = styles.TrackStyle

@@ -9,7 +9,8 @@ import (
 	"syscall"
 
 	"github.com/docker/cagent/pkg/agent"
-	latest "github.com/docker/cagent/pkg/config/v2"
+	"github.com/docker/cagent/pkg/config"
+	"github.com/docker/cagent/pkg/config/latest"
 	"github.com/docker/cagent/pkg/environment"
 	"github.com/docker/cagent/pkg/model/provider/openai"
 	"github.com/docker/cagent/pkg/runtime"
@@ -46,7 +47,7 @@ func run(ctx context.Context) error {
 				"root",
 				"You are an expert hacker",
 				agent.WithModel(llm),
-				agent.WithToolSets(builtin.NewShellTool(os.Environ())),
+				agent.WithToolSets(builtin.NewShellTool(os.Environ(), &config.RuntimeConfig{Config: config.Config{WorkingDir: "/tmp"}}, nil)),
 			),
 		),
 	)
@@ -55,7 +56,7 @@ func run(ctx context.Context) error {
 		return err
 	}
 
-	sess := session.New(session.WithUserMessage("", "Tell me a story about my current directory"))
+	sess := session.New(session.WithUserMessage("Tell me a story about my current directory"))
 
 	messages, err := rt.Run(ctx, sess)
 	if err != nil {

@@ -2,9 +2,27 @@ package tools
 
 import (
 	"context"
+	"encoding/json"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+// ToolSet defines the interface for a set of tools.
+type ToolSet interface {
+	Tools(ctx context.Context) ([]Tool, error)
+}
+
+// NewHandler creates a type-safe tool handler from a function that accepts typed parameters.
+// It handles JSON unmarshaling of the tool call arguments into the specified type T.
+func NewHandler[T any](fn func(context.Context, T) (*ToolCallResult, error)) ToolHandler {
+	return func(ctx context.Context, toolCall ToolCall) (*ToolCallResult, error) {
+		var params T
+		if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &params); err != nil {
+			return nil, err
+		}
+		return fn(ctx, params)
+	}
+}
 
 type ToolHandler func(ctx context.Context, toolCall ToolCall) (*ToolCallResult, error)
 
@@ -20,49 +38,36 @@ type FunctionCall struct {
 }
 
 type ToolCallResult struct {
-	Output string `json:"output"`
+	Output  string `json:"output"`
+	IsError bool   `json:"isError,omitempty"`
+	Meta    any    `json:"meta,omitempty"`
 }
 
-// OpenAI-like Tool Types
+func ResultError(output string) *ToolCallResult {
+	return &ToolCallResult{
+		Output:  output,
+		IsError: true,
+	}
+}
+
+func ResultSuccess(output string) *ToolCallResult {
+	return &ToolCallResult{
+		Output:  output,
+		IsError: false,
+	}
+}
 
 type ToolType string
 
 type Tool struct {
-	Name         string          `json:"name"`
-	Category     string          `json:"category"`
-	Description  string          `json:"description,omitempty"`
-	Parameters   any             `json:"parameters"`
-	Annotations  ToolAnnotations `json:"annotations"`
-	OutputSchema any             `json:"outputSchema"`
-	Handler      ToolHandler     `json:"-"`
+	Name                    string          `json:"name"`
+	Category                string          `json:"category"`
+	Description             string          `json:"description,omitempty"`
+	Parameters              any             `json:"parameters"`
+	Annotations             ToolAnnotations `json:"annotations"`
+	OutputSchema            any             `json:"outputSchema"`
+	Handler                 ToolHandler     `json:"-"`
+	AddDescriptionParameter bool            `json:"-"`
 }
 
 type ToolAnnotations mcp.ToolAnnotations
-
-type ElicitationResult struct {
-	Action  string         `json:"action"` // "accept", "decline", or "cancel"
-	Content map[string]any `json:"content,omitempty"`
-}
-
-// ElicitationHandler is a function type that handles elicitation requests from the MCP server
-// This allows the runtime to handle elicitation requests and propagate them to its own client
-type ElicitationHandler func(ctx context.Context, req *mcp.ElicitParams) (ElicitationResult, error)
-
-type ElicitationTool struct{}
-
-func (t *ElicitationTool) SetElicitationHandler(ElicitationHandler) {
-	// No-op, this tool does not use elicitation
-}
-
-func (t *ElicitationTool) SetOAuthSuccessHandler(func()) {
-	// No-op, this tool does not use OAuth
-}
-
-type ToolSet interface {
-	Tools(ctx context.Context) ([]Tool, error)
-	Instructions() string
-	Start(ctx context.Context) error
-	Stop(ctx context.Context) error
-	SetElicitationHandler(handler ElicitationHandler)
-	SetOAuthSuccessHandler(handler func())
-}

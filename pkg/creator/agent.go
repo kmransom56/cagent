@@ -1,3 +1,5 @@
+// Package creator provides functionality to create agent configurations interactively.
+// It generates a special agent that helps users build their own agent YAML files.
 package creator
 
 import (
@@ -5,21 +7,14 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
-	"log/slog"
-	"os"
-	"path/filepath"
 	"strings"
 
-	"github.com/docker/cagent/pkg/agent"
+	"github.com/goccy/go-yaml"
+
 	"github.com/docker/cagent/pkg/config"
-	latest "github.com/docker/cagent/pkg/config/v2"
-	"github.com/docker/cagent/pkg/environment"
-	"github.com/docker/cagent/pkg/model/provider"
-	"github.com/docker/cagent/pkg/model/provider/anthropic"
-	"github.com/docker/cagent/pkg/model/provider/options"
-	"github.com/docker/cagent/pkg/runtime"
-	"github.com/docker/cagent/pkg/session"
+	"github.com/docker/cagent/pkg/config/latest"
 	"github.com/docker/cagent/pkg/team"
+	"github.com/docker/cagent/pkg/teamloader"
 	"github.com/docker/cagent/pkg/tools"
 	"github.com/docker/cagent/pkg/tools/builtin"
 )
@@ -27,197 +22,153 @@ import (
 //go:embed instructions.txt
 var agentBuilderInstructions string
 
-type fsToolset struct {
-	tools.ElicitationTool
+// Constants for the creator agent configuration.
+const (
+	creatorAgentName      = "root"
+	creatorAgentModel     = "auto"
+	creatorWelcomeMessage = "Hello! I'm here to create agents for you.\n\nCan you explain to me what the agent will be used for?"
+)
 
-	inner                    tools.ToolSet
+// Agent creates and returns a team configured for the agent builder functionality.
+// The agent builder helps users create their own agent configurations interactively.
+//
+// Parameters:
+//   - ctx: Context for the operation
+//   - runConfig: Runtime configuration including working directory and environment
+//   - modelNameOverride: Optional model override (empty string uses auto-selection)
+//
+// Returns the configured team or an error if configuration fails.
+func Agent(ctx context.Context, runConfig *config.RuntimeConfig, modelNameOverride string) (*team.Team, error) {
+	instructions := buildInstructions(ctx, runConfig)
+
+	configYAML, err := buildCreatorConfigYAML(instructions)
+	if err != nil {
+		return nil, fmt.Errorf("building creator config: %w", err)
+	}
+
+	registry := createToolsetRegistry(runConfig.WorkingDir)
+
+	return teamloader.Load(
+		ctx,
+		config.NewBytesSource("creator", configYAML),
+		runConfig,
+		teamloader.WithModelOverrides([]string{modelNameOverride}),
+		teamloader.WithToolsetRegistry(registry),
+	)
+}
+
+// buildInstructions creates the full instruction set for the creator agent,
+// including provider-specific model configuration examples.
+func buildInstructions(ctx context.Context, runConfig *config.RuntimeConfig) string {
+	usableProviders := config.AvailableProviders(ctx, runConfig.ModelsGateway, runConfig.EnvProvider())
+
+	var b strings.Builder
+	b.WriteString(agentBuilderInstructions)
+	b.WriteString("\n\nPreferred model providers to use: ")
+	b.WriteString(strings.Join(usableProviders, ", "))
+	b.WriteString(". You must always use one or more of the following model configurations: \n")
+
+	for _, provider := range usableProviders {
+		model := config.DefaultModels[provider]
+		maxTokens := config.PreferredMaxTokens(provider)
+		fmt.Fprintf(&b, `
+		models:
+			%s:
+				provider: %s
+				model: %s
+				max_tokens: %d
+`, provider, provider, model, *maxTokens)
+	}
+
+	return b.String()
+}
+
+// buildCreatorConfigYAML generates the YAML configuration for the creator agent.
+// It uses yaml.MapSlice to ensure proper indentation of multi-line strings.
+func buildCreatorConfigYAML(instructions string) ([]byte, error) {
+	// Define available toolsets for the creator agent
+	toolsets := []map[string]any{
+		{"type": "shell"},
+		{"type": "filesystem"},
+	}
+
+	// Build the root agent configuration
+	rootAgent := yaml.MapSlice{
+		{Key: "model", Value: creatorAgentModel},
+		{Key: "welcome_message", Value: creatorWelcomeMessage},
+		{Key: "instruction", Value: instructions},
+		{Key: "toolsets", Value: toolsets},
+	}
+
+	// Build the full config structure
+	agentsConfig := yaml.MapSlice{
+		{Key: creatorAgentName, Value: rootAgent},
+	}
+
+	fullConfig := yaml.MapSlice{
+		{Key: "agents", Value: agentsConfig},
+	}
+
+	return yaml.Marshal(fullConfig)
+}
+
+// createToolsetRegistry creates a custom toolset registry that wraps the filesystem
+// toolset to track file paths written by the agent.
+func createToolsetRegistry(workingDir string) *teamloader.ToolsetRegistry {
+	tracker := &fileWriteTracker{
+		ToolSet: builtin.NewFilesystemTool(workingDir),
+	}
+
+	registry := teamloader.NewDefaultToolsetRegistry()
+	registry.Register("filesystem", func(context.Context, latest.Toolset, string, *config.RuntimeConfig) (tools.ToolSet, error) {
+		return tracker, nil
+	})
+
+	return registry
+}
+
+// fileWriteTracker wraps a filesystem toolset to track files written by the agent.
+// This allows the creator to know what files were created during the session.
+type fileWriteTracker struct {
+	tools.ToolSet
 	originalWriteFileHandler tools.ToolHandler
 	path                     string
 }
 
-func (f *fsToolset) Instructions() string {
-	return f.inner.Instructions()
-}
-
-func (f *fsToolset) Start(ctx context.Context) error {
-	return f.inner.Start(ctx)
-}
-
-func (f *fsToolset) Stop(ctx context.Context) error {
-	return f.inner.Stop(ctx)
-}
-
-func (f *fsToolset) Tools(ctx context.Context) ([]tools.Tool, error) {
-	innerTools, err := f.inner.Tools(ctx)
+// Tools returns the available tools, wrapping the write_file tool to track paths.
+func (t *fileWriteTracker) Tools(ctx context.Context) ([]tools.Tool, error) {
+	innerTools, err := t.ToolSet.Tools(ctx)
 	if err != nil {
 		return nil, err
 	}
 
 	for i, tool := range innerTools {
 		if tool.Name == builtin.ToolNameWriteFile {
-			f.originalWriteFileHandler = tool.Handler
-			innerTools[i].Handler = f.customWriteFileHandler
+			t.originalWriteFileHandler = tool.Handler
+			innerTools[i].Handler = t.trackWriteFile
 		}
 	}
 
 	return innerTools, nil
 }
 
-func (f *fsToolset) customWriteFileHandler(ctx context.Context, toolCall tools.ToolCall) (*tools.ToolCallResult, error) {
+// trackWriteFile intercepts write_file calls to track the path being written.
+func (t *fileWriteTracker) trackWriteFile(ctx context.Context, toolCall tools.ToolCall) (*tools.ToolCallResult, error) {
 	var args struct {
 		Path    string `json:"path"`
 		Content string `json:"content"`
 	}
 	if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &args); err != nil {
-		return nil, fmt.Errorf("failed to parse arguments: %w", err)
+		return nil, fmt.Errorf("failed to parse write_file arguments: %w", err)
 	}
 
-	f.path = args.Path
+	t.path = args.Path
 
-	return f.originalWriteFileHandler(ctx, toolCall)
+	return t.originalWriteFileHandler(ctx, toolCall)
 }
 
-func CreateAgent(ctx context.Context, baseDir, prompt string, runConfig config.RuntimeConfig) (out, path string, err error) {
-	llm, err := anthropic.NewClient(
-		ctx,
-		&latest.ModelConfig{
-			Provider:  "anthropic",
-			Model:     "claude-sonnet-4-0",
-			MaxTokens: 64000,
-		},
-		environment.NewDefaultProvider(),
-		options.WithGateway(runConfig.ModelsGateway),
-	)
-	if err != nil {
-		return "", "", fmt.Errorf("failed to create LLM client: %w", err)
-	}
-
-	slog.Info("Generating agent configuration....")
-
-	fsToolset := fsToolset{inner: builtin.NewFilesystemTool([]string{baseDir})}
-	fileName := filepath.Base(fsToolset.path)
-	newTeam := team.New(
-		team.WithID(fileName),
-		team.WithAgents(
-			agent.New(
-				"root",
-				agentBuilderInstructions,
-				agent.WithModel(llm),
-				agent.WithToolSets(
-					builtin.NewShellTool(os.Environ()),
-					&fsToolset,
-				),
-			)))
-	rt, err := runtime.New(newTeam)
-	if err != nil {
-		return "", "", fmt.Errorf("failed to create runtime: %w", err)
-	}
-
-	sess := session.New(
-		session.WithUserMessage("", prompt),
-		session.WithToolsApproved(true),
-	)
-
-	messages, err := rt.Run(ctx, sess)
-	if err != nil {
-		return "", "", fmt.Errorf("failed to run session: %w", err)
-	}
-
-	return messages[len(messages)-1].Message.Content, fsToolset.path, nil
-}
-
-func Agent(ctx context.Context, baseDir string, runConfig config.RuntimeConfig, providerName string, maxTokensOverride int, modelNameOverride string) (*team.Team, error) {
-	defaultModels := map[string]string{
-		"openai":    "gpt-5-mini",
-		"anthropic": "claude-sonnet-4-0",
-		"google":    "gemini-2.5-flash",
-		"dmr":       "ai/qwen3:latest",
-	}
-	var modelName string
-	if _, ok := defaultModels[providerName]; ok {
-		modelName = defaultModels[providerName]
-	} else {
-		modelName = defaultModels["anthropic"]
-	}
-
-	if modelNameOverride != "" {
-		modelName = modelNameOverride
-	} else {
-		slog.Info("Using default model: " + modelName)
-	}
-
-	// If not using a model gateway, avoid selecting a provider the user can't run
-	var usableProviders []string
-	if runConfig.ModelsGateway == "" {
-		if os.Getenv("OPENAI_API_KEY") != "" {
-			usableProviders = append(usableProviders, "openai")
-		}
-		if os.Getenv("ANTHROPIC_API_KEY") != "" {
-			usableProviders = append(usableProviders, "anthropic")
-		}
-		if os.Getenv("GOOGLE_API_KEY") != "" {
-			usableProviders = append(usableProviders, "google")
-		}
-		if os.Getenv("MISTRAL_API_KEY") != "" {
-			usableProviders = append(usableProviders, "mistral")
-		}
-		// DMR runs locally by default; include it when not using a gateway
-		usableProviders = append(usableProviders, "dmr")
-	}
-
-	fsToolset := fsToolset{inner: builtin.NewFilesystemTool([]string{baseDir})}
-	fileName := filepath.Base(fsToolset.path)
-
-	// Provide soft guidance to prefer the selected providers
-	instructions := agentBuilderInstructions + "\n\nPreferred model providers to use: " + strings.Join(usableProviders, ", ") + ". You must always use one or more of the following model configurations: \n"
-	for _, provider := range usableProviders {
-		suggestedMaxTokens := 64000
-		if provider == "dmr" {
-			suggestedMaxTokens = 16000
-		}
-		instructions += fmt.Sprintf(`
-		models:
-			%s:
-				provider: %s
-				model: %s
-				max_tokens: %d\n`, provider, provider, defaultModels[provider], suggestedMaxTokens)
-	}
-
-	// Use 16k for DMR to limit memory costs
-	maxTokens := 64000
-	if providerName == "dmr" {
-		maxTokens = 16000
-	}
-	if maxTokensOverride > 0 {
-		maxTokens = maxTokensOverride
-	}
-
-	llm, err := provider.New(
-		ctx,
-		&latest.ModelConfig{
-			Provider:  providerName,
-			Model:     modelName,
-			MaxTokens: maxTokens,
-		},
-		environment.NewDefaultProvider(),
-		options.WithGateway(runConfig.ModelsGateway),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create LLM client: %w", err)
-	}
-
-	newTeam := team.New(
-		team.WithID(fileName),
-		team.WithAgents(
-			agent.New(
-				"root",
-				instructions,
-				agent.WithModel(llm),
-				agent.WithToolSets(
-					builtin.NewShellTool(os.Environ()),
-					&fsToolset,
-				),
-			)))
-
-	return newTeam, nil
+// LastWrittenPath returns the path of the last file written by the agent.
+// Returns an empty string if no file has been written yet.
+func (t *fileWriteTracker) LastWrittenPath() string {
+	return t.path
 }

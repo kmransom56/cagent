@@ -1,23 +1,56 @@
 ---
 version: 2
 interactions:
-- id: 0
-  request:
-    proto: HTTP/1.1
-    proto_major: 1
-    proto_minor: 1
-    content_length: 0
-    host: api.openai.com
-    body: "{\"messages\":[{\"content\":\"You are a knowledgeable assistant that helps users with various tasks.\\nBe helpful, accurate, and concise in your responses.\\n\",\"role\":\"system\"},{\"content\":\"What's 2+2?\",\"role\":\"user\"}],\"model\":\"gpt-5\",\"stream_options\":{\"include_usage\":true},\"stream\":true}"
-    url: https://api.openai.com/v1/chat/completions
-    method: POST
-  response:
-    proto: HTTP/2.0
-    proto_major: 2
-    proto_minor: 0
-    content_length: -1
-    body: "data: {\"id\":\"chatcmpl-CZEIM0llqf375Rns0C5Z4jkatmFvv\",\"object\":\"chat.completion.chunk\",\"created\":1762512466,\"model\":\"gpt-5-2025-08-07\",\"service_tier\":\"default\",\"system_fingerprint\":null,\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\",\"refusal\":null},\"finish_reason\":null}],\"usage\":null,\"obfuscation\":\"BrPWUDKRvM\"}\n\ndata: {\"id\":\"chatcmpl-CZEIM0llqf375Rns0C5Z4jkatmFvv\",\"object\":\"chat.completion.chunk\",\"created\":1762512466,\"model\":\"gpt-5-2025-08-07\",\"service_tier\":\"default\",\"system_fingerprint\":null,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"4\"},\"finish_reason\":null}],\"usage\":null,\"obfuscation\":\"svsI0HB4ryx\"}\n\ndata: {\"id\":\"chatcmpl-CZEIM0llqf375Rns0C5Z4jkatmFvv\",\"object\":\"chat.completion.chunk\",\"created\":1762512466,\"model\":\"gpt-5-2025-08-07\",\"service_tier\":\"default\",\"system_fingerprint\":null,\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null,\"obfuscation\":\"nk6dep\"}\n\ndata: {\"id\":\"chatcmpl-CZEIM0llqf375Rns0C5Z4jkatmFvv\",\"object\":\"chat.completion.chunk\",\"created\":1762512466,\"model\":\"gpt-5-2025-08-07\",\"service_tier\":\"default\",\"system_fingerprint\":null,\"choices\":[],\"usage\":{\"prompt_tokens\":39,\"completion_tokens\":10,\"total_tokens\":49,\"prompt_tokens_details\":{\"cached_tokens\":0,\"audio_tokens\":0},\"completion_tokens_details\":{\"reasoning_tokens\":0,\"audio_tokens\":0,\"accepted_prediction_tokens\":0,\"rejected_prediction_tokens\":0}},\"obfuscation\":\"BAuo50K34JH\"}\n\ndata: [DONE]\n\n"
-    headers: {}
-    status: 200 OK
-    code: 200
-    duration: 1.868136792s
+    - id: 0
+      request:
+        proto: HTTP/1.1
+        proto_major: 1
+        proto_minor: 1
+        content_length: 0
+        host: api.openai.com
+        body: '{"input":[{"content":[{"text":"You are a knowledgeable assistant that helps users with various tasks.\nBe helpful, accurate, and concise in your responses.\n","type":"input_text"}],"role":"system"},{"content":"What''s 2+2?","role":"user"}],"model":"gpt-5","stream":true}'
+        url: https://api.openai.com/v1/responses
+        method: POST
+      response:
+        proto: HTTP/2.0
+        proto_major: 2
+        proto_minor: 0
+        content_length: -1
+        body: |+
+            event: response.created
+            data: {"type":"response.created","response":{"id":"resp_019f7c940afca45900696e6479053081909c94b7bc2b6d0815","object":"response","created_at":1768842361,"status":"in_progress","background":false,"completed_at":null,"error":null,"frequency_penalty":0.0,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"max_tool_calls":null,"model":"gpt-5-2025-08-07","output":[],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":null,"prompt_cache_retention":null,"reasoning":{"effort":"medium","summary":null},"safety_identifier":null,"service_tier":"auto","store":true,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tools":[],"top_logprobs":0,"top_p":1.0,"truncation":"disabled","usage":null,"user":null,"metadata":{}},"sequence_number":0}
+
+            event: response.in_progress
+            data: {"type":"response.in_progress","response":{"id":"resp_019f7c940afca45900696e6479053081909c94b7bc2b6d0815","object":"response","created_at":1768842361,"status":"in_progress","background":false,"completed_at":null,"error":null,"frequency_penalty":0.0,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"max_tool_calls":null,"model":"gpt-5-2025-08-07","output":[],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":null,"prompt_cache_retention":null,"reasoning":{"effort":"medium","summary":null},"safety_identifier":null,"service_tier":"auto","store":true,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tools":[],"top_logprobs":0,"top_p":1.0,"truncation":"disabled","usage":null,"user":null,"metadata":{}},"sequence_number":1}
+
+            event: response.output_item.added
+            data: {"type":"response.output_item.added","item":{"id":"rs_019f7c940afca45900696e647a4744819093a8d95a854ddea6","type":"reasoning","summary":[]},"output_index":0,"sequence_number":2}
+
+            event: response.output_item.done
+            data: {"type":"response.output_item.done","item":{"id":"rs_019f7c940afca45900696e647a4744819093a8d95a854ddea6","type":"reasoning","summary":[]},"output_index":0,"sequence_number":3}
+
+            event: response.output_item.added
+            data: {"type":"response.output_item.added","item":{"id":"msg_019f7c940afca45900696e647a77d88190afd4c23d4ece563a","type":"message","status":"in_progress","content":[],"role":"assistant"},"output_index":1,"sequence_number":4}
+
+            event: response.content_part.added
+            data: {"type":"response.content_part.added","content_index":0,"item_id":"msg_019f7c940afca45900696e647a77d88190afd4c23d4ece563a","output_index":1,"part":{"type":"output_text","annotations":[],"logprobs":[],"text":""},"sequence_number":5}
+
+            event: response.output_text.delta
+            data: {"type":"response.output_text.delta","content_index":0,"delta":"4","item_id":"msg_019f7c940afca45900696e647a77d88190afd4c23d4ece563a","logprobs":[],"obfuscation":"07Rg2hfFK2LyyEe","output_index":1,"sequence_number":6}
+
+            event: response.output_text.done
+            data: {"type":"response.output_text.done","content_index":0,"item_id":"msg_019f7c940afca45900696e647a77d88190afd4c23d4ece563a","logprobs":[],"output_index":1,"sequence_number":7,"text":"4"}
+
+            event: response.content_part.done
+            data: {"type":"response.content_part.done","content_index":0,"item_id":"msg_019f7c940afca45900696e647a77d88190afd4c23d4ece563a","output_index":1,"part":{"type":"output_text","annotations":[],"logprobs":[],"text":"4"},"sequence_number":8}
+
+            event: response.output_item.done
+            data: {"type":"response.output_item.done","item":{"id":"msg_019f7c940afca45900696e647a77d88190afd4c23d4ece563a","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":"4"}],"role":"assistant"},"output_index":1,"sequence_number":9}
+
+            event: response.completed
+            data: {"type":"response.completed","response":{"id":"resp_019f7c940afca45900696e6479053081909c94b7bc2b6d0815","object":"response","created_at":1768842361,"status":"completed","background":false,"completed_at":1768842362,"error":null,"frequency_penalty":0.0,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"max_tool_calls":null,"model":"gpt-5-2025-08-07","output":[{"id":"rs_019f7c940afca45900696e647a4744819093a8d95a854ddea6","type":"reasoning","summary":[]},{"id":"msg_019f7c940afca45900696e647a77d88190afd4c23d4ece563a","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":"4"}],"role":"assistant"}],"parallel_tool_calls":true,"presence_penalty":0.0,"previous_response_id":null,"prompt_cache_key":null,"prompt_cache_retention":null,"reasoning":{"effort":"medium","summary":null},"safety_identifier":null,"service_tier":"default","store":true,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tools":[],"top_logprobs":0,"top_p":1.0,"truncation":"disabled","usage":{"input_tokens":39,"input_tokens_details":{"cached_tokens":0},"output_tokens":7,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":46},"user":null,"metadata":{}},"sequence_number":10}
+
+        headers: {}
+        status: 200 OK
+        code: 200
+        duration: 369.216227ms

@@ -19,7 +19,7 @@ func NewCommandCompletion(a *app.App) Completion {
 }
 
 func (c *commandCompletion) AutoSubmit() bool {
-	return true
+	return true // Commands auto-submit: selecting inserts command text and sends it
 }
 
 func (c *commandCompletion) RequiresEmptyEditor() bool {
@@ -31,17 +31,21 @@ func (c *commandCompletion) Trigger() string {
 }
 
 func (c *commandCompletion) Items() []completion.Item {
-	cmds := commands.BuildCommandCategories(context.Background(), c.app)
-	items := make([]completion.Item, 0, len(cmds))
-	for _, cmd := range cmds {
+	var items []completion.Item
+
+	for _, cmd := range commands.BuildCommandCategories(context.Background(), c.app) {
 		for _, command := range cmd.Commands {
 			items = append(items, completion.Item{
 				Label:       command.Label,
 				Description: command.Description,
 				Value:       command.SlashCommand,
-				Execute:     command.Execute,
 			})
 		}
 	}
+
 	return items
+}
+
+func (c *commandCompletion) MatchMode() completion.MatchMode {
+	return completion.MatchPrefix
 }

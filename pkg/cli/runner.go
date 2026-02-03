@@ -1,8 +1,10 @@
 package cli
 
 import (
+	"cmp"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -11,7 +13,6 @@ import (
 	"strings"
 
 	"github.com/docker/cagent/pkg/chat"
-	"github.com/docker/cagent/pkg/evaluation"
 	"github.com/docker/cagent/pkg/input"
 	"github.com/docker/cagent/pkg/runtime"
 	"github.com/docker/cagent/pkg/session"
@@ -35,10 +36,13 @@ func (e RuntimeError) Unwrap() error {
 type Config struct {
 	AppName        string
 	AttachmentPath string
+	AutoApprove    bool
+	HideToolCalls  bool
+	OutputJSON     bool
 }
 
 // Run executes an agent in non-TUI mode, handling user input and runtime events
-func Run(ctx context.Context, out *Printer, cfg Config, agentFilename string, rt runtime.Runtime, sess *session.Session, args []string) error {
+func Run(ctx context.Context, out *Printer, cfg Config, rt runtime.Runtime, sess *session.Session, args []string) error {
 	// Create a cancellable context for this agentic loop and wire Ctrl+C to cancel it
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -60,80 +64,48 @@ func Run(ctx context.Context, out *Printer, cfg Config, agentFilename string, rt
 			return nil
 		}
 
-		userInput = runtime.ResolveCommand(ctx, rt, userInput)
+		sess.AddMessage(PrepareUserMessage(ctx, rt, userInput, cfg.AttachmentPath))
 
-		handled, err := runUserCommand(out, userInput, sess, rt, ctx)
-		if err != nil {
-			return err
-		}
-		if handled {
+		if cfg.OutputJSON {
+			for event := range rt.RunStream(ctx, sess) {
+				switch e := event.(type) {
+				case *runtime.ToolCallConfirmationEvent:
+					if !cfg.AutoApprove {
+						rt.Resume(ctx, runtime.ResumeReject(""))
+					}
+				case *runtime.ErrorEvent:
+					return fmt.Errorf("%s", e.Error)
+				}
+
+				buf, err := json.Marshal(event)
+				if err != nil {
+					return err
+				}
+				out.Println(string(buf))
+			}
+
 			return nil
 		}
 
-		// Parse for /attach commands in the message
-		messageText, attachPath := parseAttachCommand(userInput)
-
-		// Use either the per-message attachment or the global one
-		finalAttachPath := attachPath
-		if finalAttachPath == "" {
-			finalAttachPath = cfg.AttachmentPath
-		}
-
-		sess.AddMessage(createUserMessageWithAttachment(agentFilename, messageText, finalAttachPath))
-
 		firstLoop := true
 		lastAgent := rt.CurrentAgentName()
-		llmIsTyping := false
-		reasoningStarted := false // Track if we've printed "Thinking:" prefix
 		var lastConfirmedToolCallID string
 		for event := range rt.RunStream(ctx, sess) {
 			agentName := event.GetAgentName()
 			if agentName != "" && (firstLoop || lastAgent != agentName) {
 				if !firstLoop {
-					if llmIsTyping {
-						out.Println()
-						llmIsTyping = false
-					}
 					out.Println()
 				}
 				out.PrintAgentName(agentName)
 				firstLoop = false
 				lastAgent = agentName
-				reasoningStarted = false // Reset reasoning state on agent change
 			}
 			switch e := event.(type) {
 			case *runtime.AgentChoiceEvent:
-				agentChanged := lastAgent != e.AgentName
-				if !llmIsTyping {
-					// Only add newline if we're not already typing
-					if !agentChanged {
-						out.Println()
-					}
-					llmIsTyping = true
-				}
-				// Add newline when transitioning from reasoning to regular content
-				if reasoningStarted {
-					out.Println()
-				}
-				reasoningStarted = false // Reset when regular content starts
 				out.Print(e.Content)
 			case *runtime.AgentChoiceReasoningEvent:
-				if !reasoningStarted {
-					// First reasoning chunk: print prefix
-					prefix := "Thinking: "
-					if e.AgentName != "" && e.AgentName != "root" {
-						prefix = prefix + e.AgentName + ": "
-					}
-					out.Printf("\n%s", prefix)
-					reasoningStarted = true
-				}
-				// Continue printing reasoning content
 				out.Print(e.Content)
 			case *runtime.ToolCallConfirmationEvent:
-				if llmIsTyping {
-					out.Println()
-					llmIsTyping = false
-				}
 				result := out.PrintToolCallWithConfirmation(ctx, e.ToolCall, rd)
 				// If interrupted, skip resuming; the runtime will notice context cancellation and stop
 				if ctx.Err() != nil {
@@ -142,12 +114,12 @@ func Run(ctx context.Context, out *Printer, cfg Config, agentFilename string, rt
 				lastConfirmedToolCallID = e.ToolCall.ID // Store the ID to avoid duplicate printing
 				switch result {
 				case ConfirmationApprove:
-					rt.Resume(ctx, runtime.ResumeTypeApprove)
+					rt.Resume(ctx, runtime.ResumeApprove())
 				case ConfirmationApproveSession:
 					sess.ToolsApproved = true
-					rt.Resume(ctx, runtime.ResumeTypeApproveSession)
+					rt.Resume(ctx, runtime.ResumeApproveSession())
 				case ConfirmationReject:
-					rt.Resume(ctx, runtime.ResumeTypeReject)
+					rt.Resume(ctx, runtime.ResumeReject(""))
 					lastConfirmedToolCallID = "" // Clear on reject since tool won't execute
 				case ConfirmationAbort:
 					// Stop the agent loop immediately
@@ -155,18 +127,16 @@ func Run(ctx context.Context, out *Printer, cfg Config, agentFilename string, rt
 					continue
 				}
 			case *runtime.ToolCallEvent:
-				if llmIsTyping {
-					out.Println()
-					llmIsTyping = false
+				if cfg.HideToolCalls {
+					continue
 				}
 				// Only print if this wasn't already shown during confirmation
 				if e.ToolCall.ID != lastConfirmedToolCallID {
 					out.PrintToolCall(e.ToolCall)
 				}
 			case *runtime.ToolCallResponseEvent:
-				if llmIsTyping {
-					out.Println()
-					llmIsTyping = false
+				if cfg.HideToolCalls {
+					continue
 				}
 				out.PrintToolCallResponse(e.ToolCall, e.Response)
 				// Clear the confirmed ID after the tool completes
@@ -174,10 +144,6 @@ func Run(ctx context.Context, out *Printer, cfg Config, agentFilename string, rt
 					lastConfirmedToolCallID = ""
 				}
 			case *runtime.ErrorEvent:
-				if llmIsTyping {
-					out.Println()
-					llmIsTyping = false
-				}
 				lowerErr := strings.ToLower(e.Error)
 				if strings.Contains(lowerErr, "context cancel") && ctx.Err() != nil { // treat Ctrl+C cancellations as non-errors
 					lastErr = nil
@@ -186,28 +152,18 @@ func Run(ctx context.Context, out *Printer, cfg Config, agentFilename string, rt
 					out.PrintError(lastErr)
 				}
 			case *runtime.MaxIterationsReachedEvent:
-				if llmIsTyping {
-					out.Println()
-					llmIsTyping = false
-				}
-
 				result := out.PromptMaxIterationsContinue(ctx, e.MaxIterations)
 				switch result {
 				case ConfirmationApprove:
-					rt.Resume(ctx, runtime.ResumeTypeApprove)
+					rt.Resume(ctx, runtime.ResumeApprove())
 				case ConfirmationReject:
-					rt.Resume(ctx, runtime.ResumeTypeReject)
+					rt.Resume(ctx, runtime.ResumeReject(""))
 					return nil
 				case ConfirmationAbort:
-					rt.Resume(ctx, runtime.ResumeTypeReject)
+					rt.Resume(ctx, runtime.ResumeReject(""))
 					return nil
 				}
 			case *runtime.ElicitationRequestEvent:
-				if llmIsTyping {
-					out.Println()
-					llmIsTyping = false
-				}
-
 				serverURL := e.Meta["cagent/server_url"].(string)
 				result := out.PromptOAuthAuthorization(ctx, serverURL)
 				switch {
@@ -220,11 +176,6 @@ func Run(ctx context.Context, out *Printer, cfg Config, agentFilename string, rt
 					return fmt.Errorf("OAuth authorization rejected by user")
 				}
 			}
-		}
-
-		// If the loop ended due to Ctrl+C, inform the user succinctly
-		if ctx.Err() != nil {
-			out.Println("\n⚠️  agent stopped  ⚠️")
 		}
 
 		// Wrap runtime errors to prevent duplicate error messages and usage display
@@ -278,66 +229,33 @@ func Run(ctx context.Context, out *Printer, cfg Config, agentFilename string, rt
 	return nil
 }
 
-// runUserCommand handles built-in session commands
-// TODO: This is a duplication of builtInSessionCommands() in pkg/tui/tui.go
-func runUserCommand(out *Printer, userInput string, sess *session.Session, rt runtime.Runtime, ctx context.Context) (bool, error) {
-	switch userInput {
-	case "/exit":
-		os.Exit(0)
-	case "/eval":
-		evalFile, err := evaluation.Save(sess)
-		if err == nil {
-			out.Println("Evaluation saved to file:", evalFile)
-			return true, err
-		}
-		return true, nil
-	case "/usage":
-		out.Println("Input tokens:", sess.InputTokens)
-		out.Println("Output tokens:", sess.OutputTokens)
-		return true, nil
-	case "/new":
-		// Reset session items
-		sess.Messages = []session.Item{}
-		return true, nil
-	case "/compact":
-		// Generate a summary of the session and compact the history
-		out.Println("Generating summary...")
+// PrepareUserMessage resolves commands, parses /attach directives, and creates
+// a user message with optional image attachment. This is the common flow for
+// both TUI and CLI modes.
+//
+// Parameters:
+//   - ctx: context for command resolution
+//   - rt: runtime for command resolution
+//   - userInput: the raw user input (may contain /commands and /attach directives)
+//   - globalAttachPath: attachment path from --attach flag (can be empty)
+//
+// Returns the prepared session.Message ready to be added to the session.
+func PrepareUserMessage(ctx context.Context, rt runtime.Runtime, userInput, globalAttachPath string) *session.Message {
+	// Resolve any /command to its prompt text
+	resolvedContent := runtime.ResolveCommand(ctx, rt, userInput)
 
-		// Create a channel to capture summary events
-		events := make(chan runtime.Event, 100)
+	// Parse for /attach commands in the message
+	messageText, attachPath := ParseAttachCommand(resolvedContent)
 
-		// Generate the summary
-		rt.Summarize(ctx, sess, events)
+	// Use either the per-message attachment or the global one
+	finalAttachPath := cmp.Or(attachPath, globalAttachPath)
 
-		// Process events and show the summary
-		close(events)
-		summaryGenerated := false
-		hasWarning := false
-		for event := range events {
-			switch e := event.(type) {
-			case *runtime.SessionSummaryEvent:
-				out.Println("Summary generated and added to session")
-				out.Println("Summary:", e.Summary)
-				summaryGenerated = true
-			case *runtime.WarningEvent:
-				out.Println("Warning:", e.Message)
-				hasWarning = true
-			}
-		}
-
-		if !summaryGenerated && !hasWarning {
-			out.Println("No summary generated")
-		}
-
-		return true, nil
-	}
-
-	return false, nil
+	return CreateUserMessageWithAttachment(messageText, finalAttachPath)
 }
 
-// parseAttachCommand parses user input for /attach commands
+// ParseAttachCommand parses user input for /attach commands
 // Returns the message text (with /attach commands removed) and the attachment path
-func parseAttachCommand(userInput string) (messageText, attachPath string) {
+func ParseAttachCommand(userInput string) (messageText, attachPath string) {
 	lines := strings.Split(userInput, "\n")
 	var messageLines []string
 
@@ -389,24 +307,21 @@ func parseAttachCommand(userInput string) (messageText, attachPath string) {
 	return messageText, attachPath
 }
 
-// createUserMessageWithAttachment creates a user message with optional image attachment
-func createUserMessageWithAttachment(agentFilename, userContent, attachmentPath string) *session.Message {
+// CreateUserMessageWithAttachment creates a user message with optional image attachment
+func CreateUserMessageWithAttachment(userContent, attachmentPath string) *session.Message {
 	if attachmentPath == "" {
-		return session.UserMessage(agentFilename, userContent)
+		return session.UserMessage(userContent)
 	}
 
 	// Convert file to data URL
 	dataURL, err := fileToDataURL(attachmentPath)
 	if err != nil {
 		slog.Warn("Failed to attach file", "path", attachmentPath, "error", err)
-		return session.UserMessage(agentFilename, userContent)
+		return session.UserMessage(userContent)
 	}
 
 	// Ensure we have some text content when attaching a file
-	textContent := userContent
-	if strings.TrimSpace(textContent) == "" {
-		textContent = "Please analyze this attached file."
-	}
+	textContent := cmp.Or(strings.TrimSpace(userContent), "Please analyze this attached file.")
 
 	// Create message with multi-content including text and image
 	multiContent := []chat.MessagePart{
@@ -423,7 +338,7 @@ func createUserMessageWithAttachment(agentFilename, userContent, attachmentPath 
 		},
 	}
 
-	return session.UserMessage(agentFilename, "", multiContent...)
+	return session.UserMessage("", multiContent...)
 }
 
 // fileToDataURL converts a file to a data URL

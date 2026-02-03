@@ -15,36 +15,34 @@ import (
 	"github.com/temoto/robotstxt"
 
 	"github.com/docker/cagent/pkg/tools"
+	"github.com/docker/cagent/pkg/useragent"
 )
 
 const (
-	userAgent = "cagent/1.0"
-
 	ToolNameFetch = "fetch"
 )
 
 type FetchTool struct {
-	tools.ElicitationTool
 	handler *fetchHandler
 }
 
-var _ tools.ToolSet = (*FetchTool)(nil)
+// Verify interface compliance
+var (
+	_ tools.ToolSet      = (*FetchTool)(nil)
+	_ tools.Instructable = (*FetchTool)(nil)
+)
 
 type fetchHandler struct {
 	timeout time.Duration
 }
 
-func (h *fetchHandler) CallTool(ctx context.Context, toolCall tools.ToolCall) (*tools.ToolCallResult, error) {
-	var params struct {
-		URLs    []string `json:"urls"`
-		Timeout int      `json:"timeout,omitempty"`
-		Format  string   `json:"format,omitempty"`
-	}
+type FetchToolArgs struct {
+	URLs    []string `json:"urls"`
+	Timeout int      `json:"timeout,omitempty"`
+	Format  string   `json:"format,omitempty"`
+}
 
-	if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &params); err != nil {
-		return nil, fmt.Errorf("invalid arguments: %w", err)
-	}
-
+func (h *fetchHandler) CallTool(ctx context.Context, params FetchToolArgs) (*tools.ToolCallResult, error) {
 	if len(params.URLs) == 0 {
 		return nil, fmt.Errorf("at least one URL is required")
 	}
@@ -71,12 +69,10 @@ func (h *fetchHandler) CallTool(ctx context.Context, toolCall tools.ToolCall) (*
 	if len(params.URLs) == 1 {
 		result := results[0]
 		if result.Error != "" {
-			return &tools.ToolCallResult{Output: fmt.Sprintf("Error fetching %s: %s", result.URL, result.Error)}, nil
+			return tools.ResultError(fmt.Sprintf("Error fetching %s: %s", result.URL, result.Error)), nil
 		}
-		return &tools.ToolCallResult{
-			Output: fmt.Sprintf("Successfully fetched %s (Status: %d, Length: %d bytes):\n\n%s",
-				result.URL, result.StatusCode, result.ContentLength, result.Body),
-		}, nil
+		return tools.ResultSuccess(fmt.Sprintf("Successfully fetched %s (Status: %d, Length: %d bytes):\n\n%s",
+			result.URL, result.StatusCode, result.ContentLength, result.Body)), nil
 	}
 
 	// Multiple URLs - return structured results
@@ -85,7 +81,7 @@ func (h *fetchHandler) CallTool(ctx context.Context, toolCall tools.ToolCall) (*
 		return nil, fmt.Errorf("failed to marshal results: %w", err)
 	}
 
-	return &tools.ToolCallResult{Output: string(output)}, nil
+	return tools.ResultSuccess(string(output)), nil
 }
 
 type FetchResult struct {
@@ -124,7 +120,7 @@ func (h *fetchHandler) fetchURL(ctx context.Context, client *http.Client, urlStr
 	host := parsedURL.Host
 	allowed, cached := robotsCache[host]
 	if !cached {
-		allowed = h.checkRobotsAllowed(ctx, client, parsedURL, userAgent)
+		allowed = h.checkRobotsAllowed(ctx, client, parsedURL, useragent.Header)
 		robotsCache[host] = allowed
 	}
 
@@ -133,15 +129,13 @@ func (h *fetchHandler) fetchURL(ctx context.Context, client *http.Client, urlStr
 		return result
 	}
 
-	// Create request
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, http.NoBody)
 	if err != nil {
 		result.Error = fmt.Sprintf("failed to create request: %v", err)
 		return result
 	}
 
-	// Set User-Agent
-	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("User-Agent", useragent.Header)
 
 	switch format {
 	case "markdown":
@@ -341,19 +335,11 @@ func (t *FetchTool) Tools(context.Context) ([]tools.Tool, error) {
 				"required": []string{"urls", "format"},
 			},
 			OutputSchema: tools.MustSchemaFor[string](),
-			Handler:      t.handler.CallTool,
+			Handler:      tools.NewHandler(t.handler.CallTool),
 			Annotations: tools.ToolAnnotations{
 				ReadOnlyHint: true,
 				Title:        "Fetch URLs",
 			},
 		},
 	}, nil
-}
-
-func (t *FetchTool) Start(context.Context) error {
-	return nil
-}
-
-func (t *FetchTool) Stop(context.Context) error {
-	return nil
 }

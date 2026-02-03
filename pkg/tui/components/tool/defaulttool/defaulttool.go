@@ -1,85 +1,33 @@
 package defaulttool
 
 import (
-	"fmt"
-
-	"charm.land/bubbles/v2/spinner"
-	tea "charm.land/bubbletea/v2"
-	"github.com/charmbracelet/glamour/v2"
-
+	"github.com/docker/cagent/pkg/tui/components/spinner"
 	"github.com/docker/cagent/pkg/tui/components/toolcommon"
 	"github.com/docker/cagent/pkg/tui/core/layout"
 	"github.com/docker/cagent/pkg/tui/service"
-	"github.com/docker/cagent/pkg/tui/styles"
 	"github.com/docker/cagent/pkg/tui/types"
 )
 
-// Component is the fallback component for rendering tool calls
-// that don't have a specialized component registered.
-// It provides a standard visualization with tool name, arguments, and results.
-type Component struct {
-	message  *types.Message
-	renderer *glamour.TermRenderer
-	spinner  spinner.Model
-	width    int
-	height   int
-}
-
 // New creates a new default tool component.
-func New(
-	msg *types.Message,
-	renderer *glamour.TermRenderer,
-	_ *service.SessionState,
-) layout.Model {
-	return &Component{
-		message:  msg,
-		renderer: renderer,
-		spinner:  spinner.New(spinner.WithSpinner(spinner.Points)),
-		width:    80,
-		height:   1,
-	}
+// It provides a standard visualization with tool name, arguments, and results.
+func New(msg *types.Message, sessionState service.SessionStateReader) layout.Model {
+	return toolcommon.NewBase(msg, sessionState, render)
 }
 
-func (c *Component) SetSize(width, height int) tea.Cmd {
-	c.width = width
-	c.height = height
-	return nil
-}
-
-func (c *Component) Init() tea.Cmd {
-	if c.message.ToolStatus == types.ToolStatusPending || c.message.ToolStatus == types.ToolStatusRunning {
-		return c.spinner.Tick
-	}
-	return nil
-}
-
-func (c *Component) Update(msg tea.Msg) (layout.Model, tea.Cmd) {
-	if c.message.ToolStatus == types.ToolStatusPending || c.message.ToolStatus == types.ToolStatusRunning {
-		var cmd tea.Cmd
-		c.spinner, cmd = c.spinner.Update(msg)
-		return c, cmd
-	}
-
-	return c, nil
-}
-
-func (c *Component) View() string {
-	msg := c.message
-	displayName := msg.ToolDefinition.DisplayName()
-	content := fmt.Sprintf("%s %s", toolcommon.Icon(msg.ToolStatus), styles.HighlightStyle.Render(displayName))
-
-	if msg.ToolStatus == types.ToolStatusPending || msg.ToolStatus == types.ToolStatusRunning {
-		content += " " + c.spinner.View()
-	}
-
+func render(msg *types.Message, s spinner.Spinner, sessionState service.SessionStateReader, width, _ int) string {
+	var argsContent string
 	if msg.ToolCall.Function.Arguments != "" {
-		content += "\n" + renderToolArgs(msg.ToolCall, c.width-3)
+		argsContent = renderToolArgs(msg.ToolCall, width-4-len(msg.ToolDefinition.DisplayName()), width-3)
+	}
+
+	if argsContent == "" {
+		return toolcommon.RenderTool(msg, s, "", "", width, sessionState.HideToolResults())
 	}
 
 	var resultContent string
 	if (msg.ToolStatus == types.ToolStatusCompleted || msg.ToolStatus == types.ToolStatusError) && msg.Content != "" {
-		resultContent = toolcommon.FormatToolResult(msg.Content, c.width)
+		resultContent = toolcommon.FormatToolResult(msg.Content, width)
 	}
 
-	return styles.BaseStyle.PaddingLeft(2).PaddingTop(1).Render(content + resultContent)
+	return toolcommon.RenderTool(msg, s, argsContent, resultContent, width, sessionState.HideToolResults())
 }

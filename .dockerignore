@@ -2,6 +2,8 @@
 !/go.mod
 !/go.sum
 !./**/*.template
+!./**/*.js
+!./**/*.html
+!./**/*.css
 !./**/*.go
 !./**/*.txt
-!ca_chain.crt

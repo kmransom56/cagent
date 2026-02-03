@@ -1,7 +1,7 @@
 package root
 
 import (
-	"os"
+	"context"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
@@ -12,13 +12,14 @@ import (
 	"github.com/docker/cagent/pkg/creator"
 	"github.com/docker/cagent/pkg/runtime"
 	"github.com/docker/cagent/pkg/session"
+	"github.com/docker/cagent/pkg/sessiontitle"
 	"github.com/docker/cagent/pkg/telemetry"
 	"github.com/docker/cagent/pkg/tui"
+	tuiinput "github.com/docker/cagent/pkg/tui/input"
 )
 
 type newFlags struct {
 	modelParam         string
-	maxTokensParam     int
 	maxIterationsParam int
 	runConfig          config.RuntimeConfig
 }
@@ -27,15 +28,24 @@ func newNewCmd() *cobra.Command {
 	var flags newFlags
 
 	cmd := &cobra.Command{
-		Use:   "new",
+		Use:   "new [description]",
 		Short: "Create a new agent configuration",
-		Long:  `Create a new agent configuration by asking questions and generating a YAML file`,
-		RunE:  flags.runNewCommand,
+		Long: `Create a new agent configuration interactively.
+
+The agent builder will ask questions about what you want the agent to do,
+then generate a YAML configuration file you can use with 'cagent run'.
+
+Optionally provide a description as an argument to skip the initial prompt.`,
+		Example: `  cagent new
+  cagent new "a web scraper that extracts product prices"
+  cagent new --model openai/gpt-4o "a code reviewer agent"`,
+		GroupID: "core",
+		RunE:    flags.runNewCommand,
 	}
 
 	cmd.PersistentFlags().StringVar(&flags.modelParam, "model", "", "Model to use, optionally as provider/model where provider is one of: anthropic, openai, google, dmr. If omitted, provider is auto-selected based on available credentials or gateway")
-	cmd.PersistentFlags().IntVar(&flags.maxTokensParam, "max-tokens", 0, "Override max_tokens for the selected model (0 = default)")
 	cmd.PersistentFlags().IntVar(&flags.maxIterationsParam, "max-iterations", 0, "Maximum number of agentic loop iterations to prevent infinite loops (default: 20 for DMR, unlimited for other providers)")
+	addRuntimeConfigFlags(cmd, &flags.runConfig)
 
 	return cmd
 }
@@ -45,78 +55,65 @@ func (f *newFlags) runNewCommand(cmd *cobra.Command, args []string) error {
 
 	ctx := cmd.Context()
 
-	var model string         // final model name
-	var modelProvider string // final provider name
-
-	// Parse provider from --model if specified as "provider/model" where provider is recognized
-	derivedProvider := ""
-	if idx := strings.Index(f.modelParam, "/"); idx > 0 {
-		candidate := strings.ToLower(f.modelParam[:idx])
-		switch candidate {
-		case "anthropic", "openai", "google", "mistral", "dmr":
-			derivedProvider = candidate
-			model = f.modelParam[idx+1:]
-		}
-	}
-
-	// Determine provider
-	if derivedProvider != "" {
-		modelProvider = derivedProvider
-	} else {
-		if f.runConfig.ModelsGateway == "" {
-			switch {
-			case os.Getenv("ANTHROPIC_API_KEY") != "":
-				modelProvider = "anthropic"
-			case os.Getenv("OPENAI_API_KEY") != "":
-				modelProvider = "openai"
-			case os.Getenv("GOOGLE_API_KEY") != "":
-				modelProvider = "google"
-			case os.Getenv("MISTRAL_API_KEY") != "":
-				modelProvider = "mistral"
-			default:
-				modelProvider = "dmr"
-			}
-		} else {
-			// Using Models Gateway; default to Anthropic if not specified
-			modelProvider = "anthropic"
-		}
-	}
-
-	t, err := creator.Agent(ctx, ".", f.runConfig, modelProvider, f.maxTokensParam, model)
+	t, err := creator.Agent(ctx, &f.runConfig, f.modelParam)
 	if err != nil {
 		return err
 	}
+	defer func() {
+		// Use a fresh context for cleanup since the original may be canceled
+		cleanupCtx := context.WithoutCancel(ctx)
+		_ = t.StopToolSets(cleanupCtx)
+	}()
+
 	rt, err := runtime.New(t)
 	if err != nil {
 		return err
 	}
 
-	var prompt *string
-	opts := []session.Opt{
+	var appOpts []app.Opt
+	sessOpts := []session.Opt{
 		session.WithTitle("New agent"),
 		session.WithMaxIterations(f.maxIterationsParam),
 		session.WithToolsApproved(true),
 	}
 	if len(args) > 0 {
 		arg := strings.Join(args, " ")
-		opts = append(opts, session.WithUserMessage("", arg))
-		prompt = &arg
+		sessOpts = append(sessOpts, session.WithUserMessage(arg))
+		appOpts = append(appOpts, app.WithFirstMessage(arg))
 	}
 
-	sess := session.New(opts...)
+	sess := session.New(sessOpts...)
 
-	a := app.New("", rt, sess, prompt)
-	m := tui.New(a)
+	return runTUI(ctx, rt, sess, appOpts...)
+}
 
-	progOpts := []tea.ProgramOption{
-		tea.WithContext(ctx),
-		tea.WithFilter(tui.MouseEventFilter),
+func runTUI(ctx context.Context, rt runtime.Runtime, sess *session.Session, opts ...app.Opt) error {
+	// For local runtime, create and pass a title generator.
+	if pr, ok := rt.(*runtime.PersistentRuntime); ok {
+		if model := pr.CurrentAgent().Model(); model != nil {
+			opts = append(opts, app.WithTitleGenerator(sessiontitle.New(model)))
+		}
 	}
 
-	p := tea.NewProgram(m, progOpts...)
+	a := app.New(ctx, rt, sess, opts...)
+	m := tui.New(ctx, a)
 
+	coalescer := tuiinput.NewWheelCoalescer()
+	filter := func(model tea.Model, msg tea.Msg) tea.Msg {
+		wheelMsg, ok := msg.(tea.MouseWheelMsg)
+		if !ok {
+			return msg
+		}
+		if coalescer.Handle(wheelMsg) {
+			return nil
+		}
+		return msg
+	}
+
+	p := tea.NewProgram(m, tea.WithContext(ctx), tea.WithFilter(filter))
+	coalescer.SetSender(p.Send)
 	go a.Subscribe(ctx, p)
 
-	_, err = p.Run()
+	_, err := p.Run()
 	return err
 }

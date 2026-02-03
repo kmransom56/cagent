@@ -1,15 +1,17 @@
 package mcp
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
+	"slices"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/docker/cagent/pkg/agent"
-	"github.com/docker/cagent/pkg/agentfile"
-	"github.com/docker/cagent/pkg/cli"
 	"github.com/docker/cagent/pkg/config"
 	"github.com/docker/cagent/pkg/runtime"
 	"github.com/docker/cagent/pkg/session"
@@ -27,24 +29,74 @@ type ToolOutput struct {
 	Response string `json:"response" jsonschema:"the response from the agent"`
 }
 
-func StartMCPServer(ctx context.Context, out *cli.Printer, agentFilename string, runConfig config.RuntimeConfig) error {
+func StartMCPServer(ctx context.Context, agentFilename, agentName string, runConfig *config.RuntimeConfig) error {
 	slog.Debug("Starting MCP server", "agent", agentFilename)
 
-	agentFilename, err := agentfile.Resolve(ctx, out, agentFilename)
+	server, cleanup, err := createMCPServer(ctx, agentFilename, agentName, runConfig)
 	if err != nil {
 		return err
 	}
+	defer cleanup()
 
-	t, err := teamloader.Load(ctx, agentFilename, runConfig)
-	if err != nil {
-		return fmt.Errorf("failed to load agents: %w", err)
+	slog.Debug("MCP server starting with stdio transport")
+
+	if err := server.Run(ctx, &mcp.StdioTransport{}); err != nil {
+		return fmt.Errorf("MCP server error: %w", err)
 	}
 
-	defer func() {
+	return nil
+}
+
+// StartHTTPServer starts a streaming HTTP MCP server on the given listener
+func StartHTTPServer(ctx context.Context, agentFilename, agentName string, runConfig *config.RuntimeConfig, ln net.Listener) error {
+	slog.Debug("Starting HTTP MCP server", "agent", agentFilename, "addr", ln.Addr())
+
+	server, cleanup, err := createMCPServer(ctx, agentFilename, agentName, runConfig)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	fmt.Printf("MCP HTTP server listening on http://%s\n", ln.Addr())
+
+	httpServer := &http.Server{
+		Handler: mcp.NewStreamableHTTPHandler(func(_ *http.Request) *mcp.Server {
+			return server
+		}, nil),
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- httpServer.Serve(ln)
+	}()
+
+	select {
+	case <-ctx.Done():
+		return httpServer.Shutdown(context.Background())
+	case err := <-errCh:
+		if err == http.ErrServerClosed {
+			return nil
+		}
+		return err
+	}
+}
+
+func createMCPServer(ctx context.Context, agentFilename, agentName string, runConfig *config.RuntimeConfig) (*mcp.Server, func(), error) {
+	agentSource, err := config.Resolve(agentFilename)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	t, err := teamloader.Load(ctx, agentSource, runConfig)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to load agents: %w", err)
+	}
+
+	cleanup := func() {
 		if err := t.StopToolSets(ctx); err != nil {
 			slog.Error("Failed to stop tool sets", "error", err)
 		}
-	}()
+	}
 
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    "cagent",
@@ -52,24 +104,31 @@ func StartMCPServer(ctx context.Context, out *cli.Printer, agentFilename string,
 	}, nil)
 
 	agentNames := t.AgentNames()
+	if agentName != "" {
+		if !slices.Contains(agentNames, agentName) {
+			cleanup()
+			return nil, nil, fmt.Errorf("agent %s not found in %s", agentName, agentFilename)
+		}
+		agentNames = []string{agentName}
+	}
+
 	slog.Debug("Adding MCP tools for agents", "count", len(agentNames))
 
 	for _, agentName := range agentNames {
 		ag, err := t.Agent(agentName)
 		if err != nil {
-			return fmt.Errorf("failed to get agent %s: %w", agentName, err)
+			cleanup()
+			return nil, nil, fmt.Errorf("failed to get agent %s: %w", agentName, err)
 		}
 
-		description := ag.Description()
-		if description == "" {
-			description = fmt.Sprintf("Run the %s agent", agentName)
-		}
+		description := cmp.Or(ag.Description(), fmt.Sprintf("Run the %s agent", agentName))
 
 		slog.Debug("Adding MCP tool", "agent", agentName, "description", description)
 
 		readOnly, err := isReadOnlyAgent(ctx, ag)
 		if err != nil {
-			return fmt.Errorf("failed to determine if agent %s is read-only: %w", agentName, err)
+			cleanup()
+			return nil, nil, fmt.Errorf("failed to determine if agent %s is read-only: %w", agentName, err)
 		}
 
 		toolDef := &mcp.Tool{
@@ -82,19 +141,13 @@ func StartMCPServer(ctx context.Context, out *cli.Printer, agentFilename string,
 			OutputSchema: tools.MustSchemaFor[ToolOutput](),
 		}
 
-		mcp.AddTool(server, toolDef, CreateToolHandler(t, agentName, agentFilename))
+		mcp.AddTool(server, toolDef, CreateToolHandler(t, agentName))
 	}
 
-	slog.Debug("MCP server starting with stdio transport")
-
-	if err := server.Run(ctx, &mcp.StdioTransport{}); err != nil {
-		return fmt.Errorf("MCP server error: %w", err)
-	}
-
-	return nil
+	return server, cleanup, nil
 }
 
-func CreateToolHandler(t *team.Team, agentName, agentFilename string) func(context.Context, *mcp.CallToolRequest, ToolInput) (*mcp.CallToolResult, ToolOutput, error) {
+func CreateToolHandler(t *team.Team, agentName string) func(context.Context, *mcp.CallToolRequest, ToolInput) (*mcp.CallToolResult, ToolOutput, error) {
 	return func(ctx context.Context, req *mcp.CallToolRequest, input ToolInput) (*mcp.CallToolResult, ToolOutput, error) {
 		slog.Debug("MCP tool called", "agent", agentName, "message", input.Message)
 
@@ -106,13 +159,12 @@ func CreateToolHandler(t *team.Team, agentName, agentFilename string) func(conte
 		sess := session.New(
 			session.WithTitle("MCP tool call"),
 			session.WithMaxIterations(ag.MaxIterations()),
-			session.WithUserMessage(agentFilename, input.Message),
+			session.WithUserMessage(input.Message),
 			session.WithToolsApproved(true),
 		)
 
 		rt, err := runtime.New(t,
 			runtime.WithCurrentAgent(agentName),
-			runtime.WithRootSessionID(sess.ID),
 		)
 		if err != nil {
 			return nil, ToolOutput{}, fmt.Errorf("failed to create runtime: %w", err)
@@ -124,10 +176,7 @@ func CreateToolHandler(t *team.Team, agentName, agentFilename string) func(conte
 			return nil, ToolOutput{}, fmt.Errorf("agent execution failed: %w", err)
 		}
 
-		result := sess.GetLastAssistantMessageContent()
-		if result == "" {
-			result = "No response from agent"
-		}
+		result := cmp.Or(sess.GetLastAssistantMessageContent(), "No response from agent")
 
 		slog.Debug("Agent execution completed", "agent", agentName, "response_length", len(result))
 

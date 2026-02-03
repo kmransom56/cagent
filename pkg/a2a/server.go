@@ -7,6 +7,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"path/filepath"
+	"strings"
 
 	"github.com/a2aproject/a2a-go/a2a"
 	"github.com/a2aproject/a2a-go/a2asrv"
@@ -16,22 +18,20 @@ import (
 	"google.golang.org/adk/server/adka2a"
 	"google.golang.org/adk/session"
 
-	"github.com/docker/cagent/pkg/agentfile"
-	"github.com/docker/cagent/pkg/cli"
 	"github.com/docker/cagent/pkg/config"
 	"github.com/docker/cagent/pkg/teamloader"
 	"github.com/docker/cagent/pkg/version"
 )
 
-func Start(ctx context.Context, out *cli.Printer, agentFilename, agentName string, runConfig config.RuntimeConfig, ln net.Listener) error {
-	slog.Debug("Starting A2A server", "agent", agentFilename, "addr", ln.Addr().String())
+func Run(ctx context.Context, agentFilename, agentName string, runConfig *config.RuntimeConfig, ln net.Listener) error {
+	slog.Debug("Starting A2A server", "agent", agentName, "addr", ln.Addr().String())
 
-	agentFilename, err := agentfile.Resolve(ctx, out, agentFilename)
+	agentSource, err := config.Resolve(agentFilename)
 	if err != nil {
 		return err
 	}
 
-	t, err := teamloader.Load(ctx, agentFilename, runConfig)
+	t, err := teamloader.Load(ctx, agentSource, runConfig)
 	if err != nil {
 		return fmt.Errorf("failed to load agents: %w", err)
 	}
@@ -48,13 +48,20 @@ func Start(ctx context.Context, out *cli.Printer, agentFilename, agentName strin
 
 	baseURL := &url.URL{Scheme: "http", Host: ln.Addr().String()}
 
-	out.Println("A2A server listening on", baseURL.String())
+	slog.Debug("A2A server listening", "url", baseURL.String())
+
+	name := strings.TrimSuffix(filepath.Base(agentFilename), filepath.Ext(agentFilename))
 
 	agentPath := "/invoke"
 	agentCard := &a2a.AgentCard{
-		Name:               adkAgent.Name(),
-		Description:        adkAgent.Description(),
-		Skills:             adka2a.BuildAgentSkills(adkAgent),
+		Name:        name,
+		Description: adkAgent.Description(),
+		Skills: []a2a.AgentSkill{{
+			ID:          fmt.Sprintf("%s_%s", name, agentName),
+			Name:        agentName,
+			Description: adkAgent.Description(),
+			Tags:        []string{"llm", "cagent"},
+		}},
 		PreferredTransport: a2a.TransportProtocolJSONRPC,
 		URL:                baseURL.JoinPath(agentPath).String(),
 		Capabilities:       a2a.AgentCapabilities{Streaming: true},
@@ -65,7 +72,7 @@ func Start(ctx context.Context, out *cli.Printer, agentFilename, agentName strin
 
 	executor := newExecutorWrapper(adka2a.ExecutorConfig{
 		RunnerConfig: runner.Config{
-			AppName:        adkAgent.Name(),
+			AppName:        name,
 			Agent:          adkAgent,
 			SessionService: session.InMemoryService(),
 		},
@@ -82,7 +89,7 @@ func Start(ctx context.Context, out *cli.Printer, agentFilename, agentName strin
 		AllowHeaders: []string{"Content-Type", "Accept"},
 		MaxAge:       86400,
 	}))
-	e.Use(middleware.Logger())
+	e.Use(middleware.RequestLogger())
 
 	e.GET(a2asrv.WellKnownAgentCardPath, echo.WrapHandler(a2asrv.NewStaticAgentCardHandler(agentCard)))
 	e.POST(agentPath, echo.WrapHandler(a2asrv.NewJSONRPCHandler(a2asrv.NewHandler(executor))))

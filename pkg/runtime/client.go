@@ -14,8 +14,9 @@ import (
 	"time"
 
 	"github.com/docker/cagent/pkg/api"
-	v2 "github.com/docker/cagent/pkg/config/v2"
+	"github.com/docker/cagent/pkg/config/latest"
 	"github.com/docker/cagent/pkg/session"
+	"github.com/docker/cagent/pkg/tools"
 )
 
 // Client is an HTTP client for the cagent server API
@@ -152,8 +153,8 @@ func (c *Client) GetAgents(ctx context.Context) ([]api.Agent, error) {
 }
 
 // GetAgent retrieves an agent by ID
-func (c *Client) GetAgent(ctx context.Context, id string) (*v2.Config, error) {
-	var config v2.Config
+func (c *Client) GetAgent(ctx context.Context, id string) (*latest.Config, error) {
+	var config latest.Config
 	err := c.doRequest(ctx, http.MethodGet, "/api/agents/"+id, nil, &config)
 	return &config, err
 }
@@ -180,7 +181,7 @@ func (c *Client) CreateAgentConfig(ctx context.Context, filename, model, descrip
 }
 
 // EditAgentConfig edits an agent configuration
-func (c *Client) EditAgentConfig(ctx context.Context, filename string, config v2.Config) (*api.EditAgentConfigResponse, error) {
+func (c *Client) EditAgentConfig(ctx context.Context, filename string, config latest.Config) (*api.EditAgentConfigResponse, error) {
 	req := api.EditAgentConfigRequest{
 		AgentConfig: config,
 		Filename:    filename,
@@ -250,9 +251,9 @@ func (c *Client) CreateSession(ctx context.Context, sessTemplate *session.Sessio
 	return &sess, err
 }
 
-// ResumeSession resumes a session by ID
-func (c *Client) ResumeSession(ctx context.Context, id, confirmation string) error {
-	req := api.ResumeSessionRequest{Confirmation: confirmation}
+// ResumeSession resumes a session by ID with an optional rejection reason
+func (c *Client) ResumeSession(ctx context.Context, id, confirmation, reason string) error {
+	req := api.ResumeSessionRequest{Confirmation: confirmation, Reason: reason}
 	return c.doRequest(ctx, http.MethodPost, "/api/sessions/"+id+"/resume", req, nil)
 }
 
@@ -373,17 +374,13 @@ func (c *Client) runAgentWithAgentName(ctx context.Context, sessionID, agent, ag
 	return eventChan, nil
 }
 
-func (c *Client) ResumeStartAuthorizationFlow(ctx context.Context, id string, confirmation bool) error {
-	req := api.ResumeStartOauthRequest{Confirmation: confirmation}
-	return c.doRequest(ctx, http.MethodPost, "/api/"+id+"/resumeStartOauth", req, nil)
+func (c *Client) ResumeElicitation(ctx context.Context, sessionID string, action tools.ElicitationAction, content map[string]any) error {
+	req := api.ResumeElicitationRequest{Action: string(action), Content: content}
+	return c.doRequest(ctx, http.MethodPost, "/api/sessions/"+sessionID+"/elicitation", req, nil)
 }
 
-func (c *Client) ResumeCodeReceived(ctx context.Context, code, state string) error {
-	req := api.ResumeCodeReceivedOauthRequest{Code: code, State: state}
-	return c.doRequest(ctx, http.MethodPost, "/api/resumeCodeReceivedOauth", req, nil)
-}
-
-func (c *Client) ResumeElicitation(ctx context.Context, action string, content map[string]any) error {
-	req := api.ResumeElicitationRequest{Action: action, Content: content}
-	return c.doRequest(ctx, http.MethodPost, "/api/resumeElicitation", req, nil)
+// UpdateSessionTitle updates the title of a session
+func (c *Client) UpdateSessionTitle(ctx context.Context, sessionID, title string) error {
+	req := api.UpdateSessionTitleRequest{Title: title}
+	return c.doRequest(ctx, http.MethodPatch, "/api/sessions/"+sessionID+"/title", req, nil)
 }

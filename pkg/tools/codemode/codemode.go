@@ -35,16 +35,17 @@ func Wrap(toolsets ...tools.ToolSet) tools.ToolSet {
 }
 
 type codeModeTool struct {
-	tools.ElicitationTool
 	toolsets []tools.ToolSet
 }
 
+// Verify interface compliance
+var (
+	_ tools.ToolSet   = (*codeModeTool)(nil)
+	_ tools.Startable = (*codeModeTool)(nil)
+)
+
 type RunToolsWithJavascriptArgs struct {
 	Script string `json:"script" jsonschema:"Script to execute"`
-}
-
-func (c *codeModeTool) Instructions() string {
-	return ""
 }
 
 func isExcludedTool(tool tools.Tool) bool {
@@ -77,12 +78,7 @@ func (c *codeModeTool) Tools(ctx context.Context) ([]tools.Tool, error) {
 		Category:    "code mode",
 		Description: prompt + strings.Join(functionsDoc, "\n"),
 		Parameters:  tools.MustSchemaFor[RunToolsWithJavascriptArgs](),
-		Handler: func(ctx context.Context, toolCall tools.ToolCall) (*tools.ToolCallResult, error) {
-			var args RunToolsWithJavascriptArgs
-			if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &args); err != nil {
-				return nil, fmt.Errorf("parsing arguments: %w", err)
-			}
-
+		Handler: tools.NewHandler(func(ctx context.Context, args RunToolsWithJavascriptArgs) (*tools.ToolCallResult, error) {
 			result, err := c.runJavascript(ctx, args.Script)
 			if err != nil {
 				return nil, err
@@ -93,10 +89,8 @@ func (c *codeModeTool) Tools(ctx context.Context) ([]tools.Tool, error) {
 				return nil, fmt.Errorf("marshaling script's result: %w", err)
 			}
 
-			return &tools.ToolCallResult{
-				Output: string(buf),
-			}, nil
-		},
+			return tools.ResultSuccess(string(buf)), nil
+		}),
 		OutputSchema: tools.MustSchemaFor[ScriptResult](),
 		Annotations: tools.ToolAnnotations{
 			Title: "Run tools with Javascript",
@@ -110,8 +104,10 @@ func (c *codeModeTool) Tools(ctx context.Context) ([]tools.Tool, error) {
 
 func (c *codeModeTool) Start(ctx context.Context) error {
 	for _, t := range c.toolsets {
-		if err := t.Start(ctx); err != nil {
-			return err
+		if startable, ok := t.(tools.Startable); ok {
+			if err := startable.Start(ctx); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -122,8 +118,10 @@ func (c *codeModeTool) Stop(ctx context.Context) error {
 	var errs []error
 
 	for _, t := range c.toolsets {
-		if err := t.Stop(ctx); err != nil {
-			errs = append(errs, err)
+		if startable, ok := t.(tools.Startable); ok {
+			if err := startable.Stop(ctx); err != nil {
+				errs = append(errs, err)
+			}
 		}
 	}
 

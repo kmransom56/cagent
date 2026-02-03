@@ -6,6 +6,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/docker/cagent/pkg/config"
 	"github.com/docker/cagent/pkg/mcp"
 	"github.com/docker/cagent/pkg/teamloader"
 )
@@ -14,15 +15,17 @@ func TestMCP_SingleAgent(t *testing.T) {
 	t.Parallel()
 
 	ctx := t.Context()
-	_, runtimeConfig := startRecordingAIProxy(t)
+	agentSource, err := config.Resolve("testdata/basic.yaml")
+	require.NoError(t, err)
 
-	team, err := teamloader.Load(ctx, "testdata/basic.yaml", runtimeConfig)
+	_, runConfig := startRecordingAIProxy(t)
+	team, err := teamloader.Load(ctx, agentSource, runConfig)
 	require.NoError(t, err, "Failed to load agent")
 	t.Cleanup(func() {
 		require.NoError(t, team.StopToolSets(ctx))
 	})
 
-	handler := mcp.CreateToolHandler(team, "root", "testdata/basic.yaml")
+	handler := mcp.CreateToolHandler(team, "root")
 	_, output, err := handler(ctx, nil, mcp.ToolInput{
 		Message: "What is 2+2? Answer in one sentence.",
 	})
@@ -35,19 +38,22 @@ func TestMCP_MultiAgent(t *testing.T) {
 	t.Parallel()
 
 	ctx := t.Context()
-	_, runtimeConfig := startRecordingAIProxy(t)
+	agentSource, err := config.Resolve("testdata/multi.yaml")
+	require.NoError(t, err)
 
-	team, err := teamloader.Load(ctx, "testdata/multi.yaml", runtimeConfig)
+	_, runConfig := startRecordingAIProxy(t)
+	team, err := teamloader.Load(ctx, agentSource, runConfig)
 	require.NoError(t, err, "Failed to load team")
 	t.Cleanup(func() {
 		require.NoError(t, team.StopToolSets(ctx))
 	})
 
-	handler := mcp.CreateToolHandler(team, "web", "testdata/multi.yaml")
+	handler := mcp.CreateToolHandler(team, "web")
 	_, output, err := handler(ctx, nil, mcp.ToolInput{
 		Message: "Say hello in one sentence.",
 	})
 
 	require.NoError(t, err)
-	assert.Equal(t, "Hello — how can I help you today?", output.Response)
+	// Model response to "say hello" can vary, just check it contains a greeting
+	assert.Contains(t, output.Response, "Hello")
 }

@@ -1,14 +1,16 @@
 package mcp
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"iter"
 	"log/slog"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -20,46 +22,71 @@ type mcpClient interface {
 	Initialize(ctx context.Context, request *mcp.InitializeRequest) (*mcp.InitializeResult, error)
 	ListTools(ctx context.Context, request *mcp.ListToolsParams) iter.Seq2[*mcp.Tool, error]
 	CallTool(ctx context.Context, request *mcp.CallToolParams) (*mcp.CallToolResult, error)
+	ListPrompts(ctx context.Context, request *mcp.ListPromptsParams) iter.Seq2[*mcp.Prompt, error]
+	GetPrompt(ctx context.Context, request *mcp.GetPromptParams) (*mcp.GetPromptResult, error)
 	SetElicitationHandler(handler tools.ElicitationHandler)
 	SetOAuthSuccessHandler(handler func())
+	SetManagedOAuth(managed bool)
 	Close(ctx context.Context) error
 }
 
 // Toolset represents a set of MCP tools
 type Toolset struct {
+	name         string
 	mcpClient    mcpClient
 	logID        string
 	instructions string
-	started      atomic.Bool
+	mu           sync.Mutex
+	started      bool
 }
 
 var _ tools.ToolSet = (*Toolset)(nil)
 
+// Verify that Toolset implements optional capability interfaces
+var (
+	_ tools.Instructable = (*Toolset)(nil)
+	_ tools.Elicitable   = (*Toolset)(nil)
+	_ tools.OAuthCapable = (*Toolset)(nil)
+)
+
 // NewToolsetCommand creates a new MCP toolset from a command.
-func NewToolsetCommand(command string, args, env []string) *Toolset {
+func NewToolsetCommand(name, command string, args, env []string, cwd string) *Toolset {
 	slog.Debug("Creating Stdio MCP toolset", "command", command, "args", args)
 
 	return &Toolset{
-		mcpClient: newStdioCmdClient(command, args, env),
+		name:      name,
+		mcpClient: newStdioCmdClient(command, args, env, cwd),
 		logID:     command,
 	}
 }
 
 // NewRemoteToolset creates a new MCP toolset from a remote MCP Server.
-func NewRemoteToolset(url, transport string, headers map[string]string, redirectURI string) *Toolset {
-	slog.Debug("Creating Remote MCP toolset", "url", url, "transport", transport, "headers", headers, "redirectURI", redirectURI)
+func NewRemoteToolset(name, url, transport string, headers map[string]string) *Toolset {
+	slog.Debug("Creating Remote MCP toolset", "url", url, "transport", transport, "headers", headers)
 
 	return &Toolset{
-		mcpClient: newRemoteClient(url, transport, headers, redirectURI, NewInMemoryTokenStore()),
+		name:      name,
+		mcpClient: newRemoteClient(url, transport, headers, NewInMemoryTokenStore()),
 		logID:     url,
 	}
 }
 
 func (ts *Toolset) Start(ctx context.Context) error {
-	if ts.started.Load() {
-		return errors.New("toolset already started")
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+
+	if ts.started {
+		return nil
 	}
 
+	err := ts.doStart(ctx)
+	if err == nil {
+		ts.started = true
+	}
+	return err
+}
+
+func (ts *Toolset) doStart(ctx context.Context) error {
 	// The MCP toolset connection needs to persist beyond the initial HTTP request that triggered its creation.
 	// When OAuth succeeds, subsequent agent requests should reuse the already-authenticated MCP connection.
 	// But if the connection's underlying context is tied to the first HTTP request, it gets cancelled when that request
@@ -74,6 +101,12 @@ func (ts *Toolset) Start(ctx context.Context) error {
 			ClientInfo: &mcp.Implementation{
 				Name:    "cagent",
 				Version: "1.0.0",
+			},
+			Capabilities: &mcp.ClientCapabilities{
+				Elicitation: &mcp.ElicitationCapabilities{
+					Form: &mcp.FormElicitationCapabilities{},
+					URL:  &mcp.URLElicitationCapabilities{},
+				},
 			},
 		},
 	}
@@ -91,6 +124,17 @@ func (ts *Toolset) Start(ctx context.Context) error {
 		//
 		// Only retry when initialization fails due to sending the initialized notification.
 		if !isInitNotificationSendError(err) {
+
+			// EOF means the MCP server is unavailable or closed the connection.
+			// This is not a fatal error and should not fail the agent execution.
+			if errors.Is(err, io.EOF) {
+				slog.Debug(
+					"MCP client unavailable (EOF), skipping MCP toolset",
+					"server", ts.logID,
+				)
+				return nil
+			}
+
 			slog.Error("Failed to initialize MCP client", "error", err)
 			return fmt.Errorf("failed to initialize MCP client: %w", err)
 		}
@@ -109,12 +153,14 @@ func (ts *Toolset) Start(ctx context.Context) error {
 
 	slog.Debug("Started MCP toolset successfully", "server", ts.logID)
 	ts.instructions = result.Instructions
-	ts.started.Store(true)
 	return nil
 }
 
 func (ts *Toolset) Instructions() string {
-	if !ts.started.Load() {
+	ts.mu.Lock()
+	started := ts.started
+	ts.mu.Unlock()
+	if !started {
 		// TODO: this should never happen...
 		return ""
 	}
@@ -122,7 +168,10 @@ func (ts *Toolset) Instructions() string {
 }
 
 func (ts *Toolset) Tools(ctx context.Context) ([]tools.Tool, error) {
-	if !ts.started.Load() {
+	ts.mu.Lock()
+	started := ts.started
+	ts.mu.Unlock()
+	if !started {
 		return nil, errors.New("toolset not started")
 	}
 
@@ -136,8 +185,13 @@ func (ts *Toolset) Tools(ctx context.Context) ([]tools.Tool, error) {
 			return nil, err
 		}
 
+		name := t.Name
+		if ts.name != "" {
+			name = fmt.Sprintf("%s_%s", ts.name, name)
+		}
+
 		tool := tools.Tool{
-			Name:         t.Name,
+			Name:         name,
 			Description:  t.Description,
 			Parameters:   t.InputSchema,
 			OutputSchema: t.OutputSchema,
@@ -148,7 +202,7 @@ func (ts *Toolset) Tools(ctx context.Context) ([]tools.Tool, error) {
 		}
 		toolsList = append(toolsList, tool)
 
-		slog.Debug("Added MCP tool", "tool", t.Name)
+		slog.Debug("Added MCP tool", "tool", name)
 	}
 
 	slog.Debug("Listed MCP tools", "count", len(toolsList))
@@ -158,9 +212,7 @@ func (ts *Toolset) Tools(ctx context.Context) ([]tools.Tool, error) {
 func (ts *Toolset) callTool(ctx context.Context, toolCall tools.ToolCall) (*tools.ToolCallResult, error) {
 	slog.Debug("Calling MCP tool", "tool", toolCall.Function.Name, "arguments", toolCall.Function.Arguments)
 
-	if toolCall.Function.Arguments == "" {
-		toolCall.Function.Arguments = "{}"
-	}
+	toolCall.Function.Arguments = cmp.Or(toolCall.Function.Arguments, "{}")
 	var args map[string]any
 	if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &args); err != nil {
 		slog.Error("Failed to parse tool arguments", "tool", toolCall.Function.Name, "error", err)
@@ -225,13 +277,12 @@ func processMCPContent(toolResult *mcp.CallToolResult) *tools.ToolCallResult {
 	}
 
 	// Handle an empty response. This can happen if the MCP tool does not return any content.
-	if finalContent == "" {
-		finalContent = "no output"
-	}
+	finalContent = cmp.Or(finalContent, "no output")
 
-	return &tools.ToolCallResult{
-		Output: finalContent,
+	if toolResult.IsError {
+		return tools.ResultError(finalContent)
 	}
+	return tools.ResultSuccess(finalContent)
 }
 
 func (ts *Toolset) SetElicitationHandler(handler tools.ElicitationHandler) {
@@ -240,4 +291,87 @@ func (ts *Toolset) SetElicitationHandler(handler tools.ElicitationHandler) {
 
 func (ts *Toolset) SetOAuthSuccessHandler(handler func()) {
 	ts.mcpClient.SetOAuthSuccessHandler(handler)
+}
+
+func (ts *Toolset) SetManagedOAuth(managed bool) {
+	ts.mcpClient.SetManagedOAuth(managed)
+}
+
+// ListPrompts retrieves available prompts from the MCP server.
+// Returns a slice of PromptInfo containing metadata about each available prompt
+// including name, description, and argument specifications.
+func (ts *Toolset) ListPrompts(ctx context.Context) ([]PromptInfo, error) {
+	ts.mu.Lock()
+	started := ts.started
+	ts.mu.Unlock()
+	if !started {
+		return nil, errors.New("toolset not started")
+	}
+
+	slog.Debug("Listing MCP prompts")
+
+	// Call the underlying MCP client to list prompts
+	resp := ts.mcpClient.ListPrompts(ctx, &mcp.ListPromptsParams{})
+
+	var promptsList []PromptInfo
+	for prompt, err := range resp {
+		if err != nil {
+			slog.Warn("Error listing MCP prompt", "error", err)
+			return promptsList, err
+		}
+
+		// Convert MCP prompt to our internal PromptInfo format
+		promptInfo := PromptInfo{
+			Name:        prompt.Name,
+			Description: prompt.Description,
+			Arguments:   make([]PromptArgument, 0),
+		}
+
+		// Convert arguments if they exist
+		if prompt.Arguments != nil {
+			for _, arg := range prompt.Arguments {
+				promptArg := PromptArgument{
+					Name:        arg.Name,
+					Description: arg.Description,
+					Required:    arg.Required,
+				}
+				promptInfo.Arguments = append(promptInfo.Arguments, promptArg)
+			}
+		}
+
+		promptsList = append(promptsList, promptInfo)
+		slog.Debug("Added MCP prompt", "prompt", prompt.Name, "args_count", len(promptInfo.Arguments))
+	}
+
+	slog.Debug("Listed MCP prompts", "count", len(promptsList))
+	return promptsList, nil
+}
+
+// GetPrompt retrieves a specific prompt with provided arguments from the MCP server.
+// This method executes the prompt and returns the result content.
+func (ts *Toolset) GetPrompt(ctx context.Context, name string, arguments map[string]string) (*mcp.GetPromptResult, error) {
+	ts.mu.Lock()
+	started := ts.started
+	ts.mu.Unlock()
+	if !started {
+		return nil, errors.New("toolset not started")
+	}
+
+	slog.Debug("Getting MCP prompt", "prompt", name, "arguments", arguments)
+
+	// Prepare the request parameters
+	request := &mcp.GetPromptParams{
+		Name:      name,
+		Arguments: arguments,
+	}
+
+	// Call the underlying MCP client to get the prompt
+	result, err := ts.mcpClient.GetPrompt(ctx, request)
+	if err != nil {
+		slog.Error("Failed to get MCP prompt", "prompt", name, "error", err)
+		return nil, fmt.Errorf("failed to get prompt %s: %w", name, err)
+	}
+
+	slog.Debug("Retrieved MCP prompt", "prompt", name, "messages_count", len(result.Messages))
+	return result, nil
 }

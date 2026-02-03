@@ -8,16 +8,14 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	latest "github.com/docker/cagent/pkg/config/v2"
+	"github.com/docker/cagent/pkg/config/latest"
 	"github.com/docker/cagent/pkg/environment"
 )
 
 func TestAutoRegisterModels(t *testing.T) {
 	t.Parallel()
 
-	root := openRoot(t, "testdata")
-
-	cfg, err := LoadConfig("autoregister.yaml", root)
+	cfg, err := Load(t.Context(), testfileSource("testdata/autoregister.yaml"))
 	require.NoError(t, err)
 
 	assert.Len(t, cfg.Models, 2)
@@ -30,9 +28,7 @@ func TestAutoRegisterModels(t *testing.T) {
 func TestAutoRegisterAlloy(t *testing.T) {
 	t.Parallel()
 
-	root := openRoot(t, "testdata")
-
-	cfg, err := LoadConfig("autoregister_alloy.yaml", root)
+	cfg, err := Load(t.Context(), testfileSource("testdata/autoregister_alloy.yaml"))
 	require.NoError(t, err)
 
 	assert.Len(t, cfg.Models, 2)
@@ -42,12 +38,41 @@ func TestAutoRegisterAlloy(t *testing.T) {
 	assert.Equal(t, "claude-sonnet-4-0", cfg.Models["anthropic/claude-sonnet-4-0"].Model)
 }
 
+func TestAlloyModelComposition(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := Load(t.Context(), testfileSource("testdata/alloy_model_composition.yaml"))
+	require.NoError(t, err)
+
+	// The alloy model should be expanded to its constituent models
+	assert.Equal(t, "opus,gpt", cfg.Agents.First().Model)
+
+	// The constituent models should still exist
+	assert.Equal(t, "anthropic", cfg.Models["opus"].Provider)
+	assert.Equal(t, "claude-opus-4-5", cfg.Models["opus"].Model)
+	assert.Equal(t, "openai", cfg.Models["gpt"].Provider)
+	assert.Equal(t, "gpt-5.2", cfg.Models["gpt"].Model)
+}
+
+func TestAlloyModelNestedComposition(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := Load(t.Context(), testfileSource("testdata/alloy_model_nested.yaml"))
+	require.NoError(t, err)
+
+	// The nested alloy should be fully expanded to all constituent models
+	assert.Equal(t, "opus,gpt,gemini", cfg.Agents.First().Model)
+
+	// All base models should exist
+	assert.Equal(t, "anthropic", cfg.Models["opus"].Provider)
+	assert.Equal(t, "openai", cfg.Models["gpt"].Provider)
+	assert.Equal(t, "google", cfg.Models["gemini"].Provider)
+}
+
 func TestMigrate_v0_v1_provider(t *testing.T) {
 	t.Parallel()
 
-	root := openRoot(t, "testdata")
-
-	cfg, err := LoadConfig("provider_v0.yaml", root)
+	cfg, err := Load(t.Context(), testfileSource("testdata/provider_v0.yaml"))
 	require.NoError(t, err)
 
 	assert.Equal(t, "openai", cfg.Models["gpt"].Provider)
@@ -56,9 +81,7 @@ func TestMigrate_v0_v1_provider(t *testing.T) {
 func TestMigrate_v1_provider(t *testing.T) {
 	t.Parallel()
 
-	root := openRoot(t, "testdata")
-
-	cfg, err := LoadConfig("provider_v1.yaml", root)
+	cfg, err := Load(t.Context(), testfileSource("testdata/provider_v1.yaml"))
 	require.NoError(t, err)
 
 	assert.Equal(t, "openai", cfg.Models["gpt"].Provider)
@@ -67,119 +90,101 @@ func TestMigrate_v1_provider(t *testing.T) {
 func TestMigrate_v0_v1_todo(t *testing.T) {
 	t.Parallel()
 
-	root := openRoot(t, "testdata")
-
-	cfg, err := LoadConfig("todo_v0.yaml", root)
+	cfg, err := Load(t.Context(), testfileSource("testdata/todo_v0.yaml"))
 	require.NoError(t, err)
 
-	assert.Len(t, cfg.Agents["root"].Toolsets, 2)
-	assert.Equal(t, "todo", cfg.Agents["root"].Toolsets[0].Type)
-	assert.False(t, cfg.Agents["root"].Toolsets[0].Shared)
-	assert.Equal(t, "mcp", cfg.Agents["root"].Toolsets[1].Type)
+	assert.Len(t, cfg.Agents.First().Toolsets, 2)
+	assert.Equal(t, "todo", cfg.Agents.First().Toolsets[0].Type)
+	assert.False(t, cfg.Agents.First().Toolsets[0].Shared)
+	assert.Equal(t, "mcp", cfg.Agents.First().Toolsets[1].Type)
 }
 
 func TestMigrate_v1_todo(t *testing.T) {
 	t.Parallel()
 
-	root := openRoot(t, "testdata")
-
-	cfg, err := LoadConfig("todo_v1.yaml", root)
+	cfg, err := Load(t.Context(), testfileSource("testdata/todo_v1.yaml"))
 	require.NoError(t, err)
 
-	assert.Len(t, cfg.Agents["root"].Toolsets, 2)
-	assert.Equal(t, "todo", cfg.Agents["root"].Toolsets[0].Type)
-	assert.False(t, cfg.Agents["root"].Toolsets[0].Shared)
-	assert.Equal(t, "mcp", cfg.Agents["root"].Toolsets[1].Type)
+	assert.Len(t, cfg.Agents.First().Toolsets, 2)
+	assert.Equal(t, "todo", cfg.Agents.First().Toolsets[0].Type)
+	assert.False(t, cfg.Agents.First().Toolsets[0].Shared)
+	assert.Equal(t, "mcp", cfg.Agents.First().Toolsets[1].Type)
 }
 
 func TestMigrate_v0_v1_shared_todo(t *testing.T) {
 	t.Parallel()
 
-	root := openRoot(t, "testdata")
-
-	cfg, err := LoadConfig("shared_todo_v0.yaml", root)
+	cfg, err := Load(t.Context(), testfileSource("testdata/shared_todo_v0.yaml"))
 	require.NoError(t, err)
 
-	assert.Len(t, cfg.Agents["root"].Toolsets, 2)
-	assert.Equal(t, "todo", cfg.Agents["root"].Toolsets[0].Type)
-	assert.True(t, cfg.Agents["root"].Toolsets[0].Shared)
-	assert.Equal(t, "mcp", cfg.Agents["root"].Toolsets[1].Type)
+	assert.Len(t, cfg.Agents.First().Toolsets, 2)
+	assert.Equal(t, "todo", cfg.Agents.First().Toolsets[0].Type)
+	assert.True(t, cfg.Agents.First().Toolsets[0].Shared)
+	assert.Equal(t, "mcp", cfg.Agents.First().Toolsets[1].Type)
 }
 
 func TestMigrate_v1_shared_todo(t *testing.T) {
 	t.Parallel()
 
-	root := openRoot(t, "testdata")
-
-	cfg, err := LoadConfig("shared_todo_v1.yaml", root)
+	cfg, err := Load(t.Context(), testfileSource("testdata/shared_todo_v1.yaml"))
 	require.NoError(t, err)
 
-	assert.Len(t, cfg.Agents["root"].Toolsets, 2)
-	assert.Equal(t, "todo", cfg.Agents["root"].Toolsets[0].Type)
-	assert.True(t, cfg.Agents["root"].Toolsets[0].Shared)
-	assert.Equal(t, "mcp", cfg.Agents["root"].Toolsets[1].Type)
+	assert.Len(t, cfg.Agents.First().Toolsets, 2)
+	assert.Equal(t, "todo", cfg.Agents.First().Toolsets[0].Type)
+	assert.True(t, cfg.Agents.First().Toolsets[0].Shared)
+	assert.Equal(t, "mcp", cfg.Agents.First().Toolsets[1].Type)
 }
 
 func TestMigrate_v0_v1_think(t *testing.T) {
 	t.Parallel()
 
-	root := openRoot(t, "testdata")
-
-	cfg, err := LoadConfig("think_v0.yaml", root)
+	cfg, err := Load(t.Context(), testfileSource("testdata/think_v0.yaml"))
 	require.NoError(t, err)
 
-	assert.Len(t, cfg.Agents["root"].Toolsets, 2)
-	assert.Equal(t, "think", cfg.Agents["root"].Toolsets[0].Type)
-	assert.Equal(t, "mcp", cfg.Agents["root"].Toolsets[1].Type)
+	assert.Len(t, cfg.Agents.First().Toolsets, 2)
+	assert.Equal(t, "think", cfg.Agents.First().Toolsets[0].Type)
+	assert.Equal(t, "mcp", cfg.Agents.First().Toolsets[1].Type)
 }
 
 func TestMigrate_v1_think(t *testing.T) {
 	t.Parallel()
 
-	root := openRoot(t, "testdata")
-
-	cfg, err := LoadConfig("think_v1.yaml", root)
+	cfg, err := Load(t.Context(), testfileSource("testdata/think_v1.yaml"))
 	require.NoError(t, err)
 
-	assert.Len(t, cfg.Agents["root"].Toolsets, 2)
-	assert.Equal(t, "think", cfg.Agents["root"].Toolsets[0].Type)
-	assert.Equal(t, "mcp", cfg.Agents["root"].Toolsets[1].Type)
+	assert.Len(t, cfg.Agents.First().Toolsets, 2)
+	assert.Equal(t, "think", cfg.Agents.First().Toolsets[0].Type)
+	assert.Equal(t, "mcp", cfg.Agents.First().Toolsets[1].Type)
 }
 
 func TestMigrate_v0_v1_memory(t *testing.T) {
 	t.Parallel()
 
-	root := openRoot(t, "testdata")
-
-	cfg, err := LoadConfig("memory_v0.yaml", root)
+	cfg, err := Load(t.Context(), testfileSource("testdata/memory_v0.yaml"))
 	require.NoError(t, err)
 
-	assert.Len(t, cfg.Agents["root"].Toolsets, 2)
-	assert.Equal(t, "memory", cfg.Agents["root"].Toolsets[0].Type)
-	assert.Equal(t, "dev_memory.db", cfg.Agents["root"].Toolsets[0].Path)
-	assert.Equal(t, "mcp", cfg.Agents["root"].Toolsets[1].Type)
+	assert.Len(t, cfg.Agents.First().Toolsets, 2)
+	assert.Equal(t, "memory", cfg.Agents.First().Toolsets[0].Type)
+	assert.Equal(t, "dev_memory.db", cfg.Agents.First().Toolsets[0].Path)
+	assert.Equal(t, "mcp", cfg.Agents.First().Toolsets[1].Type)
 }
 
 func TestMigrate_v1_memory(t *testing.T) {
 	t.Parallel()
 
-	root := openRoot(t, "testdata")
-
-	cfg, err := LoadConfig("memory_v1.yaml", root)
+	cfg, err := Load(t.Context(), testfileSource("testdata/memory_v1.yaml"))
 	require.NoError(t, err)
 
-	assert.Len(t, cfg.Agents["root"].Toolsets, 2)
-	assert.Equal(t, "memory", cfg.Agents["root"].Toolsets[0].Type)
-	assert.Equal(t, "dev_memory.db", cfg.Agents["root"].Toolsets[0].Path)
-	assert.Equal(t, "mcp", cfg.Agents["root"].Toolsets[1].Type)
+	assert.Len(t, cfg.Agents.First().Toolsets, 2)
+	assert.Equal(t, "memory", cfg.Agents.First().Toolsets[0].Type)
+	assert.Equal(t, "dev_memory.db", cfg.Agents.First().Toolsets[0].Path)
+	assert.Equal(t, "mcp", cfg.Agents.First().Toolsets[1].Type)
 }
 
 func TestMigrate_v1(t *testing.T) {
 	t.Parallel()
 
-	root := openRoot(t, "testdata")
-
-	_, err := LoadConfig("v1.yaml", root)
+	_, err := Load(t.Context(), testfileSource("testdata/v1.yaml"))
 	require.NoError(t, err)
 }
 
@@ -195,9 +200,11 @@ func openRoot(t *testing.T, dir string) *os.Root {
 
 type noEnvProvider struct{}
 
-func (p *noEnvProvider) Get(context.Context, string) string { return "" }
+func (p *noEnvProvider) Get(context.Context, string) (string, bool) { return "", false }
 
 func TestCheckRequiredEnvVars(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		yaml            string
 		expectedMissing []string
@@ -246,17 +253,19 @@ func TestCheckRequiredEnvVars(t *testing.T) {
 			yaml:            "all.yaml",
 			expectedMissing: []string{"ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "MISTRAL_API_KEY", "OPENAI_API_KEY"},
 		},
+		{
+			yaml:            "openai_and_unused_mistral_model.yaml",
+			expectedMissing: []string{"OPENAI_API_KEY"},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.yaml, func(t *testing.T) {
 			t.Parallel()
 
-			root := openRoot(t, "testdata/env")
-
-			cfg, err := LoadConfig(test.yaml, root)
+			cfg, err := Load(t.Context(), testfileSource("testdata/env/"+test.yaml))
 			require.NoError(t, err)
 
-			err = CheckRequiredEnvVars(t.Context(), cfg, &noEnvProvider{}, RuntimeConfig{})
+			err = CheckRequiredEnvVars(t.Context(), cfg, "", &noEnvProvider{})
 
 			if len(test.expectedMissing) == 0 {
 				require.NoError(t, err)
@@ -271,14 +280,10 @@ func TestCheckRequiredEnvVars(t *testing.T) {
 func TestCheckRequiredEnvVarsWithModelGateway(t *testing.T) {
 	t.Parallel()
 
-	root := openRoot(t, "testdata/env")
-
-	cfg, err := LoadConfig("all.yaml", root)
+	cfg, err := Load(t.Context(), testfileSource("testdata/env/all.yaml"))
 	require.NoError(t, err)
 
-	err = CheckRequiredEnvVars(t.Context(), cfg, &noEnvProvider{}, RuntimeConfig{
-		ModelsGateway: "gateway:8080",
-	})
+	err = CheckRequiredEnvVars(t.Context(), cfg, "gateway:8080", &noEnvProvider{})
 
 	require.NoError(t, err)
 }
@@ -286,7 +291,7 @@ func TestCheckRequiredEnvVarsWithModelGateway(t *testing.T) {
 func TestApplyModelOverrides(t *testing.T) {
 	tests := []struct {
 		name        string
-		agents      map[string]latest.AgentConfig
+		agents      []latest.AgentConfig
 		overrides   []string
 		expected    map[string]string // agent name -> expected model
 		expectError bool
@@ -294,9 +299,9 @@ func TestApplyModelOverrides(t *testing.T) {
 	}{
 		{
 			name: "global override",
-			agents: map[string]latest.AgentConfig{
-				"root":  {Model: "openai/gpt-4"},
-				"other": {Model: "anthropic/claude-3"},
+			agents: []latest.AgentConfig{
+				{Name: "root", Model: "openai/gpt-4"},
+				{Name: "other", Model: "anthropic/claude-3"},
 			},
 			overrides: []string{"google/gemini-pro"},
 			expected: map[string]string{
@@ -306,9 +311,9 @@ func TestApplyModelOverrides(t *testing.T) {
 		},
 		{
 			name: "single per-agent override",
-			agents: map[string]latest.AgentConfig{
-				"root":  {Model: "openai/gpt-4"},
-				"other": {Model: "anthropic/claude-3"},
+			agents: []latest.AgentConfig{
+				{Name: "root", Model: "openai/gpt-4"},
+				{Name: "other", Model: "anthropic/claude-3"},
 			},
 			overrides: []string{"other=google/gemini-pro"},
 			expected: map[string]string{
@@ -318,9 +323,9 @@ func TestApplyModelOverrides(t *testing.T) {
 		},
 		{
 			name: "multiple separate flags",
-			agents: map[string]latest.AgentConfig{
-				"root":  {Model: "openai/gpt-4"},
-				"other": {Model: "anthropic/claude-3"},
+			agents: []latest.AgentConfig{
+				{Name: "root", Model: "openai/gpt-4"},
+				{Name: "other", Model: "anthropic/claude-3"},
 			},
 			overrides: []string{"root=openai/gpt-5", "other=anthropic/claude-sonnet-4-0"},
 			expected: map[string]string{
@@ -330,10 +335,10 @@ func TestApplyModelOverrides(t *testing.T) {
 		},
 		{
 			name: "comma-separated format",
-			agents: map[string]latest.AgentConfig{
-				"root":  {Model: "openai/gpt-4"},
-				"other": {Model: "anthropic/claude-3"},
-				"third": {Model: "google/gemini-pro"},
+			agents: []latest.AgentConfig{
+				{Name: "root", Model: "openai/gpt-4"},
+				{Name: "other", Model: "anthropic/claude-3"},
+				{Name: "third", Model: "google/gemini-pro"},
 			},
 			overrides: []string{"root=openai/gpt-5,other=anthropic/claude-sonnet-4-0"},
 			expected: map[string]string{
@@ -344,11 +349,11 @@ func TestApplyModelOverrides(t *testing.T) {
 		},
 		{
 			name: "mixed formats",
-			agents: map[string]latest.AgentConfig{
-				"root":     {Model: "openai/gpt-4"},
-				"other":    {Model: "anthropic/claude-3"},
-				"third":    {Model: "google/gemini-pro"},
-				"reviewer": {Model: "openai/gpt-3.5-turbo"},
+			agents: []latest.AgentConfig{
+				{Name: "root", Model: "openai/gpt-4"},
+				{Name: "other", Model: "anthropic/claude-3"},
+				{Name: "third", Model: "google/gemini-pro"},
+				{Name: "reviewer", Model: "openai/gpt-3.5-turbo"},
 			},
 			overrides: []string{"root=openai/gpt-5,other=anthropic/claude-4", "reviewer=google/gemini-1.5-pro"},
 			expected: map[string]string{
@@ -360,8 +365,8 @@ func TestApplyModelOverrides(t *testing.T) {
 		},
 		{
 			name: "last override wins",
-			agents: map[string]latest.AgentConfig{
-				"root": {Model: "openai/gpt-4"},
+			agents: []latest.AgentConfig{
+				{Name: "root", Model: "openai/gpt-4"},
 			},
 			overrides: []string{"root=openai/gpt-5", "root=anthropic/claude-4"},
 			expected: map[string]string{
@@ -370,8 +375,8 @@ func TestApplyModelOverrides(t *testing.T) {
 		},
 		{
 			name: "unknown agent error",
-			agents: map[string]latest.AgentConfig{
-				"root": {Model: "openai/gpt-4"},
+			agents: []latest.AgentConfig{
+				{Name: "root", Model: "openai/gpt-4"},
 			},
 			overrides:   []string{"nonexistent=openai/gpt-5"},
 			expectError: true,
@@ -379,8 +384,8 @@ func TestApplyModelOverrides(t *testing.T) {
 		},
 		{
 			name: "empty model spec error",
-			agents: map[string]latest.AgentConfig{
-				"root": {Model: "openai/gpt-4"},
+			agents: []latest.AgentConfig{
+				{Name: "root", Model: "openai/gpt-4"},
 			},
 			overrides:   []string{"root="},
 			expectError: true,
@@ -388,8 +393,8 @@ func TestApplyModelOverrides(t *testing.T) {
 		},
 		{
 			name: "empty global model spec is skipped",
-			agents: map[string]latest.AgentConfig{
-				"root": {Model: "openai/gpt-4"},
+			agents: []latest.AgentConfig{
+				{Name: "root", Model: "openai/gpt-4"},
 			},
 			overrides: []string{""},
 			expected: map[string]string{
@@ -398,9 +403,9 @@ func TestApplyModelOverrides(t *testing.T) {
 		},
 		{
 			name: "whitespace handling",
-			agents: map[string]latest.AgentConfig{
-				"root":  {Model: "openai/gpt-4"},
-				"other": {Model: "anthropic/claude-3"},
+			agents: []latest.AgentConfig{
+				{Name: "root", Model: "openai/gpt-4"},
+				{Name: "other", Model: "anthropic/claude-3"},
 			},
 			overrides: []string{" root = openai/gpt-5 , other = anthropic/claude-4 "},
 			expected: map[string]string{
@@ -425,9 +430,101 @@ func TestApplyModelOverrides(t *testing.T) {
 				require.ErrorContains(t, err, tt.errorMsg)
 			} else {
 				require.NoError(t, err)
-				for agentName, expectedModel := range tt.expected {
-					assert.Equal(t, expectedModel, cfg.Agents[agentName].Model)
+				for _, agent := range cfg.Agents {
+					assert.Equal(t, tt.expected[agent.Name], agent.Model, "wrong model for agent %s", agent.Name)
 				}
+			}
+		})
+	}
+}
+
+func TestProviders_Validation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		providers map[string]latest.ProviderConfig
+		wantErr   string
+	}{
+		{
+			name: "valid provider",
+			providers: map[string]latest.ProviderConfig{
+				"my_provider": {
+					APIType:  "openai_chatcompletions",
+					BaseURL:  "https://api.example.com/v1",
+					TokenKey: "MY_API_KEY",
+				},
+			},
+			wantErr: "",
+		},
+		{
+			name: "valid provider with responses api_type",
+			providers: map[string]latest.ProviderConfig{
+				"responses_provider": {
+					APIType: "openai_responses",
+					BaseURL: "https://api.example.com/v1",
+				},
+			},
+			wantErr: "",
+		},
+		{
+			name: "valid provider with empty api_type",
+			providers: map[string]latest.ProviderConfig{
+				"default_provider": {
+					BaseURL: "https://api.example.com/v1",
+				},
+			},
+			wantErr: "",
+		},
+		{
+			name: "missing base_url",
+			providers: map[string]latest.ProviderConfig{
+				"no_base_url": {
+					APIType: "openai_chatcompletions",
+				},
+			},
+			wantErr: "base_url is required",
+		},
+		{
+			name: "invalid api_type",
+			providers: map[string]latest.ProviderConfig{
+				"bad_provider": {
+					APIType: "invalid_api_type",
+					BaseURL: "https://api.example.com/v1",
+				},
+			},
+			wantErr: "invalid api_type 'invalid_api_type'",
+		},
+		{
+			name: "provider name with slash",
+			providers: map[string]latest.ProviderConfig{
+				"bad/name": {
+					APIType: "openai_chatcompletions",
+					BaseURL: "https://api.example.com/v1",
+				},
+			},
+			wantErr: "name cannot contain '/'",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg := &latest.Config{
+				Providers: tt.providers,
+				Agents: []latest.AgentConfig{
+					{Name: "root", Model: "openai/gpt-4o"},
+				},
+			}
+
+			err := validateConfig(cfg)
+
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+			} else {
+				require.NoError(t, err)
 			}
 		})
 	}

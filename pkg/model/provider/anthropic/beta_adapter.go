@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/packages/ssestream"
@@ -14,23 +15,40 @@ import (
 
 // betaStreamAdapter adapts the Anthropic Beta stream to our interface
 type betaStreamAdapter struct {
-	stream   *ssestream.Stream[anthropic.BetaRawMessageStreamEventUnion]
-	toolCall bool
-	toolID   string
+	stream     *ssestream.Stream[anthropic.BetaRawMessageStreamEventUnion]
+	trackUsage bool
+	toolCall   bool
+	toolID     string
+	// For single retry on context length error
+	retryFn            func() *betaStreamAdapter
+	retried            bool
+	getResponseTrailer func() http.Header
 }
 
 // newBetaStreamAdapter creates a new Beta stream adapter
-func newBetaStreamAdapter(stream *ssestream.Stream[anthropic.BetaRawMessageStreamEventUnion]) *betaStreamAdapter {
+func (c *Client) newBetaStreamAdapter(stream *ssestream.Stream[anthropic.BetaRawMessageStreamEventUnion], trackUsage bool) *betaStreamAdapter {
 	return &betaStreamAdapter{
-		stream: stream,
+		stream:             stream,
+		trackUsage:         trackUsage,
+		getResponseTrailer: c.getResponseTrailer,
 	}
 }
 
 // Recv gets the next completion chunk from the Beta stream
 func (a *betaStreamAdapter) Recv() (chat.MessageStreamResponse, error) {
 	if !a.stream.Next() {
-		if a.stream.Err() != nil {
-			return chat.MessageStreamResponse{}, a.stream.Err()
+		err := a.stream.Err()
+		// Single retry on context length error
+		if err != nil && !a.retried && a.retryFn != nil && isContextLengthError(err) {
+			a.retried = true
+			if retry := a.retryFn(); retry != nil {
+				a.stream.Close()
+				a.stream = retry.stream
+				return a.Recv()
+			}
+		}
+		if err != nil {
+			return chat.MessageStreamResponse{}, err
 		}
 		return chat.MessageStreamResponse{}, io.EOF
 	}
@@ -73,7 +91,6 @@ func (a *betaStreamAdapter) Recv() (chat.MessageStreamResponse, error) {
 			}
 			if block.Signature != "" {
 				response.Choices[0].Delta.ThinkingSignature = block.Signature
-				slog.Debug("Received thinking signature (start)", "signature", block.Signature)
 			}
 		}
 	case anthropic.BetaRawContentBlockDeltaEvent:
@@ -95,16 +112,17 @@ func (a *betaStreamAdapter) Recv() (chat.MessageStreamResponse, error) {
 		case anthropic.BetaSignatureDelta:
 			// Signature delta is for thinking blocks - capture it so we can replay thinking in history
 			response.Choices[0].Delta.ThinkingSignature = deltaVariant.Signature
-			slog.Debug("Received thinking signature", "signature", deltaVariant.Signature)
 		default:
 			return response, fmt.Errorf("unknown delta type: %T", deltaVariant)
 		}
 	case anthropic.BetaRawMessageDeltaEvent:
-		response.Usage = &chat.Usage{
-			InputTokens:        int(eventVariant.Usage.InputTokens),
-			OutputTokens:       int(eventVariant.Usage.OutputTokens),
-			CachedInputTokens:  int(eventVariant.Usage.CacheReadInputTokens),
-			CachedOutputTokens: int(eventVariant.Usage.CacheCreationInputTokens),
+		if a.trackUsage {
+			response.Usage = &chat.Usage{
+				InputTokens:       eventVariant.Usage.InputTokens,
+				OutputTokens:      eventVariant.Usage.OutputTokens,
+				CachedInputTokens: eventVariant.Usage.CacheReadInputTokens,
+				CacheWriteTokens:  eventVariant.Usage.CacheCreationInputTokens,
+			}
 		}
 	case anthropic.BetaRawMessageStopEvent:
 		if a.toolCall {

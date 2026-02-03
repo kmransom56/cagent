@@ -11,8 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/xeipuuv/gojsonschema"
 
-	latest "github.com/docker/cagent/pkg/config/v2"
-	"github.com/docker/cagent/pkg/filesystem"
+	"github.com/docker/cagent/pkg/config/latest"
 	"github.com/docker/cagent/pkg/modelsdev"
 )
 
@@ -43,21 +42,31 @@ func TestParseExamples(t *testing.T) {
 		t.Run(file, func(t *testing.T) {
 			t.Parallel()
 
-			cfg, err := LoadConfig(file, filesystem.AllowAll)
+			cfg, err := Load(t.Context(), testfileSource(file))
 
 			require.NoError(t, err)
 			require.Equal(t, latest.Version, cfg.Version, "Version should be %d in %s", latest.Version, file)
-			require.NotEmpty(t, cfg.Agents["root"].Description, "Description should not be empty in %s", file)
-			require.NotEmpty(t, cfg.Agents["root"].Instruction, "Instruction should not be empty in %s", file)
+			require.NotEmpty(t, cfg.Agents)
+			require.NotEmpty(t, cfg.Agents.First().Description, "Description should not be empty in %s", file)
 
 			for _, agent := range cfg.Agents {
 				require.NotEmpty(t, agent.Model)
+				require.NotEmpty(t, agent.Instruction, "Instruction should not be empty in %s", file)
 			}
 
 			for _, model := range cfg.Models {
 				require.NotEmpty(t, model.Provider)
 				require.NotEmpty(t, model.Model)
+				// Skip providers that don't have entries in models.dev
 				if model.Provider == "dmr" {
+					continue
+				}
+				// Skip models with routing rules - they use multiple providers
+				if len(model.Routing) > 0 {
+					continue
+				}
+				// Skip models that use custom providers (defined in cfg.Providers)
+				if _, isCustomProvider := cfg.Providers[model.Provider]; isCustomProvider {
 					continue
 				}
 

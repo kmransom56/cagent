@@ -1,11 +1,15 @@
 package anthropic
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/anthropics/anthropic-sdk-go"
@@ -13,7 +17,7 @@ import (
 	"github.com/anthropics/anthropic-sdk-go/packages/param"
 
 	"github.com/docker/cagent/pkg/chat"
-	latest "github.com/docker/cagent/pkg/config/v2"
+	"github.com/docker/cagent/pkg/config/latest"
 	"github.com/docker/cagent/pkg/environment"
 	"github.com/docker/cagent/pkg/httpclient"
 	"github.com/docker/cagent/pkg/model/provider/base"
@@ -25,7 +29,54 @@ import (
 // It holds the anthropic client and model config
 type Client struct {
 	base.Config
-	clientFn func(context.Context) (anthropic.Client, error)
+	clientFn         func(context.Context) (anthropic.Client, error)
+	lastHTTPResponse *http.Response
+}
+
+func (c *Client) getResponseTrailer() http.Header {
+	if c.lastHTTPResponse == nil {
+		return nil
+	}
+
+	if c.lastHTTPResponse.Body != nil {
+		_, _ = io.Copy(io.Discard, c.lastHTTPResponse.Body)
+	}
+
+	return c.lastHTTPResponse.Trailer
+}
+
+// adjustMaxTokensForThinking checks if max_tokens needs adjustment for thinking_budget.
+// Anthropic's max_tokens represents the combined budget for thinking + output tokens.
+// Returns the adjusted maxTokens value and an error if user-set max_tokens is too low.
+func (c *Client) adjustMaxTokensForThinking(maxTokens int64) (int64, error) {
+	if c.ModelConfig.ThinkingBudget == nil || c.ModelConfig.ThinkingBudget.Tokens <= 0 {
+		return maxTokens, nil
+	}
+
+	thinkingTokens := int64(c.ModelConfig.ThinkingBudget.Tokens)
+	minRequired := thinkingTokens + 1024 // configured thinking budget + minimum output buffer
+
+	if maxTokens <= thinkingTokens {
+		userSetMaxTokens := c.ModelConfig.MaxTokens != nil
+		if userSetMaxTokens {
+			// User explicitly set max_tokens too low - return error
+			slog.Error("Anthropic: max_tokens must be greater than thinking_budget",
+				"max_tokens", maxTokens,
+				"thinking_budget", thinkingTokens)
+			return 0, fmt.Errorf("anthropic: max_tokens (%d) must be greater than thinking_budget (%d); increase max_tokens to at least %d",
+				maxTokens, thinkingTokens, minRequired)
+		}
+		// Auto-adjust when user didn't set max_tokens
+		slog.Info("Anthropic: auto-adjusting max_tokens to accommodate thinking_budget",
+			"original_max_tokens", maxTokens,
+			"thinking_budget", thinkingTokens,
+			"new_max_tokens", minRequired)
+		// return the configured thinking budget + 8192 because that's the default
+		// max_tokens value for anthropic models when unspecified by the user
+		return thinkingTokens + 8192, nil
+	}
+
+	return maxTokens, nil
 }
 
 // interleavedThinkingEnabled returns false unless explicitly enabled via
@@ -68,14 +119,28 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 		return nil, errors.New("model type must be 'anthropic'")
 	}
 
-	var globalOptions options.ModelOptions
-	for _, opt := range opts {
-		opt(&globalOptions)
+	if env == nil {
+		slog.Error("Anthropic client creation failed", "error", "environment provider is required")
+		return nil, errors.New("environment provider is required")
 	}
 
-	var clientFn func(context.Context) (anthropic.Client, error)
+	var globalOptions options.ModelOptions
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&globalOptions)
+		}
+	}
+
+	anthropicClient := &Client{
+		Config: base.Config{
+			ModelConfig:  *cfg,
+			ModelOptions: globalOptions,
+			Env:          env,
+		},
+	}
+
 	if gateway := globalOptions.Gateway(); gateway == "" {
-		authToken := env.Get(ctx, "ANTHROPIC_API_KEY")
+		authToken, _ := env.Get(ctx, "ANTHROPIC_API_KEY")
 		if authToken == "" {
 			return nil, errors.New("ANTHROPIC_API_KEY environment variable is required")
 		}
@@ -89,51 +154,56 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 			requestOptions = append(requestOptions, option.WithBaseURL(cfg.BaseURL))
 		}
 		client := anthropic.NewClient(requestOptions...)
-		clientFn = func(context.Context) (anthropic.Client, error) {
+		anthropicClient.clientFn = func(context.Context) (anthropic.Client, error) {
 			return client, nil
 		}
 	} else {
 		// Fail fast if Docker Desktop's auth token isn't available
-		if env.Get(ctx, environment.DockerDesktopTokenEnv) == "" {
+		if token, _ := env.Get(ctx, environment.DockerDesktopTokenEnv); token == "" {
 			slog.Error("Anthropic client creation failed", "error", "failed to get Docker Desktop's authentication token")
 			return nil, errors.New("sorry, you first need to sign in Docker Desktop to use the Docker AI Gateway")
 		}
 
 		// When using a Gateway, tokens are short-lived.
-		clientFn = func(ctx context.Context) (anthropic.Client, error) {
+		anthropicClient.clientFn = func(ctx context.Context) (anthropic.Client, error) {
 			// Query a fresh auth token each time the client is used
-			authToken := env.Get(ctx, environment.DockerDesktopTokenEnv)
+			authToken, _ := env.Get(ctx, environment.DockerDesktopTokenEnv)
 			if authToken == "" {
 				return anthropic.Client{}, errors.New("failed to get Docker Desktop token for Gateway")
 			}
 
-			return anthropic.NewClient(
+			url, err := url.Parse(gateway)
+			if err != nil {
+				return anthropic.Client{}, fmt.Errorf("invalid gateway URL: %w", err)
+			}
+			baseURL := fmt.Sprintf("%s://%s%s/", url.Scheme, url.Host, url.Path)
+
+			// Configure a custom HTTP client to inject headers and query params used by the Gateway.
+			httpOptions := []httpclient.Opt{
+				httpclient.WithProxiedBaseURL(cmp.Or(cfg.BaseURL, "https://api.anthropic.com/")),
+				httpclient.WithProvider(cfg.Provider),
+				httpclient.WithModel(cfg.Model),
+				httpclient.WithQuery(url.Query()),
+			}
+			if globalOptions.GeneratingTitle() {
+				httpOptions = append(httpOptions, httpclient.WithHeader("X-Cagent-GeneratingTitle", "1"))
+			}
+
+			client := anthropic.NewClient(
+				option.WithResponseInto(&anthropicClient.lastHTTPResponse),
 				option.WithAuthToken(authToken),
 				option.WithAPIKey(authToken),
-				option.WithBaseURL(gateway),
-				option.WithHTTPClient(httpclient.NewHTTPClient(
-					httpclient.WithProxiedBaseURL(defaultsTo(cfg.BaseURL, "https://api.anthropic.com/")),
-					httpclient.WithProvider(cfg.Provider),
-					httpclient.WithModel(cfg.Model),
-				)),
-			), nil
+				option.WithBaseURL(baseURL),
+				option.WithHTTPClient(httpclient.NewHTTPClient(httpOptions...)),
+			)
+
+			return client, nil
 		}
 	}
 
 	slog.Debug("Anthropic client created successfully", "model", cfg.Model)
 
-	if globalOptions.StructuredOutput() != nil {
-		return nil, errors.New("anthropic does not support native structured_output")
-	}
-
-	return &Client{
-		Config: base.Config{
-			ModelConfig:  *cfg,
-			ModelOptions: globalOptions,
-			Env:          env,
-		},
-		clientFn: clientFn,
-	}, nil
+	return anthropicClient, nil
 }
 
 // CreateChatCompletionStream creates a streaming chat completion request
@@ -147,9 +217,15 @@ func (c *Client) CreateChatCompletionStream(
 		"message_count", len(messages),
 		"tool_count", len(requestTools))
 
-	maxTokens := int64(c.ModelConfig.MaxTokens)
+	// Default to 8192 if maxTokens is not set (0)
+	// This is a safe default that works for all Anthropic models
+	maxTokens := c.ModelOptions.MaxTokens()
 	if maxTokens == 0 {
-		maxTokens = 8192 // Default output budget when not specified
+		maxTokens = 8192
+	}
+	maxTokens, err := c.adjustMaxTokensForThinking(maxTokens)
+	if err != nil {
+		return nil, err
 	}
 
 	client, err := c.clientFn(ctx)
@@ -158,8 +234,11 @@ func (c *Client) CreateChatCompletionStream(
 		return nil, err
 	}
 
-	// Use Beta API with interleaved thinking only when enabled
-	if c.interleavedThinkingEnabled() {
+	// Use Beta API when:
+	// 1. Interleaved thinking is enabled, or
+	// 2. Structured output is configured
+	// Note: Structured outputs require beta header support (only available on BetaMessageNewParams)
+	if c.interleavedThinkingEnabled() || c.ModelOptions.StructuredOutput() != nil {
 		return c.createBetaStream(ctx, client, messages, requestTools, maxTokens)
 	}
 
@@ -179,47 +258,43 @@ func (c *Client) CreateChatCompletionStream(
 			return nil, err
 		}
 	}
-	// Preflight-cap max_tokens using Anthropic's count-tokens API
 	sys := extractSystemBlocks(messages)
-	if used, err := countAnthropicTokens(ctx, client, anthropic.Model(c.ModelConfig.Model), converted, sys, allTools); err == nil {
-		configuredMaxTokens := maxTokens
-		maxTokens = clampMaxTokens(anthropicContextLimit(c.ModelConfig.Model), used, maxTokens)
-		if maxTokens < configuredMaxTokens {
-			slog.Warn("Anthropic API max_tokens clamped to", "max_tokens", maxTokens)
-		}
-	}
 
 	params := anthropic.MessageNewParams{
 		Model:     anthropic.Model(c.ModelConfig.Model),
 		MaxTokens: maxTokens,
+		System:    sys,
 		Messages:  converted,
 		Tools:     allTools,
 	}
 
-	if c.ModelConfig.Temperature != nil {
-		params.Temperature = param.NewOpt(*c.ModelConfig.Temperature)
-	}
-	if c.ModelConfig.TopP != nil {
-		params.TopP = param.NewOpt(*c.ModelConfig.TopP)
-	}
-
-	// Populate proper Anthropic system prompt from input messages
-	if len(sys) > 0 {
-		params.System = sys
-	}
-
-	// Apply thinking budget
+	// Apply thinking budget first, as it affects whether we can set temperature
+	thinkingEnabled := false
 	if c.ModelConfig.ThinkingBudget != nil && c.ModelConfig.ThinkingBudget.Tokens > 0 {
 		thinkingTokens := int64(c.ModelConfig.ThinkingBudget.Tokens)
 		switch {
 		case thinkingTokens >= 1024 && thinkingTokens < maxTokens:
 			params.Thinking = anthropic.ThinkingConfigParamOfEnabled(thinkingTokens)
+			thinkingEnabled = true
 			slog.Debug("Anthropic API using thinking_budget (standard messages)", "budget_tokens", thinkingTokens)
 		case thinkingTokens >= maxTokens:
 			slog.Warn("Anthropic thinking_budget must be less than max_tokens, ignoring", "tokens", thinkingTokens, "max_tokens", maxTokens)
 		default:
 			slog.Warn("Anthropic thinking_budget below minimum (1024), ignoring", "tokens", thinkingTokens)
 		}
+	}
+
+	// Temperature and TopP cannot be set when extended thinking is enabled
+	// (Anthropic requires temperature=1.0 which is the default when thinking is on)
+	if !thinkingEnabled {
+		if c.ModelConfig.Temperature != nil {
+			params.Temperature = param.NewOpt(*c.ModelConfig.Temperature)
+		}
+		if c.ModelConfig.TopP != nil {
+			params.TopP = param.NewOpt(*c.ModelConfig.TopP)
+		}
+	} else if c.ModelConfig.Temperature != nil || c.ModelConfig.TopP != nil {
+		slog.Debug("Anthropic extended thinking enabled, ignoring temperature/top_p settings")
 	}
 
 	if len(requestTools) > 0 {
@@ -240,8 +315,31 @@ func (c *Client) CreateChatCompletionStream(
 		slog.Debug("Request", "request", string(b))
 	}
 
-	stream := client.Messages.NewStreaming(ctx, params)
-	ad := newStreamAdapter(stream)
+	// Add fine-grained tool streaming beta header
+	betaHeader := option.WithHeader("anthropic-beta", "fine-grained-tool-streaming-2025-05-14")
+
+	stream := client.Messages.NewStreaming(ctx, params, betaHeader)
+	trackUsage := c.ModelConfig.TrackUsage == nil || *c.ModelConfig.TrackUsage
+	ad := c.newStreamAdapter(stream, trackUsage)
+
+	// Set up single retry for context length errors
+	ad.retryFn = func() *streamAdapter {
+		used, err := countAnthropicTokens(ctx, client, anthropic.Model(c.ModelConfig.Model), converted, sys, allTools)
+		if err != nil {
+			slog.Warn("Failed to count tokens for retry, skipping", "error", err)
+			return nil
+		}
+		newMaxTokens := clampMaxTokens(anthropicContextLimit(c.ModelConfig.Model), used, maxTokens)
+		if newMaxTokens >= maxTokens {
+			slog.Warn("Token count does not require clamping, not retrying")
+			return nil
+		}
+		slog.Warn("Retrying with clamped max_tokens after context length error", "original max_tokens", maxTokens, "clamped max_tokens", newMaxTokens, "used tokens", used)
+		retryParams := params
+		retryParams.MaxTokens = newMaxTokens
+		return c.newStreamAdapter(client.Messages.NewStreaming(ctx, retryParams, betaHeader), trackUsage)
+	}
+
 	slog.Debug("Anthropic chat completion stream created successfully", "model", c.ModelConfig.Model)
 	return ad, nil
 }
@@ -292,26 +390,18 @@ func convertMessages(messages []chat.Message) []anthropic.MessageParam {
 									mediaType = "image/jpeg"
 								}
 
-								// Create image block using raw JSON approach
-								// Based on: https://docs.anthropic.com/en/api/messages-vision
-								imageBlockJSON := map[string]any{
-									"type": "image",
-									"source": map[string]any{
-										"type":       "base64",
-										"media_type": mediaType,
-										"data":       base64Data,
-									},
-								}
-
-								// Convert to JSON and back to ContentBlockParamUnion
-								jsonBytes, err := json.Marshal(imageBlockJSON)
-								if err == nil {
-									var imageBlock anthropic.ContentBlockParamUnion
-									if json.Unmarshal(jsonBytes, &imageBlock) == nil {
-										contentBlocks = append(contentBlocks, imageBlock)
-									}
-								}
+								// Use SDK helper with proper typed source for better performance
+								// (avoids JSON marshal/unmarshal round trip)
+								contentBlocks = append(contentBlocks, anthropic.NewImageBlock(anthropic.Base64ImageSourceParam{
+									Data:      base64Data,
+									MediaType: anthropic.Base64ImageSourceMediaType(mediaType),
+								}))
 							}
+						} else if strings.HasPrefix(part.ImageURL.URL, "http://") || strings.HasPrefix(part.ImageURL.URL, "https://") {
+							// Support URL-based images - Anthropic can fetch images directly from URLs
+							contentBlocks = append(contentBlocks, anthropic.NewImageBlock(anthropic.URLImageSourceParam{
+								URL: part.ImageURL.URL,
+							}))
 						}
 					}
 				}
@@ -405,7 +495,37 @@ func convertMessages(messages []chat.Message) []anthropic.MessageParam {
 			continue
 		}
 	}
+
+	// Add ephemeral cache to last 2 messages' last content block
+	applyMessageCacheControl(anthropicMessages)
+
 	return anthropicMessages
+}
+
+// applyMessageCacheControl adds ephemeral cache control to the last content block
+// of the last 2 messages for prompt caching.
+func applyMessageCacheControl(messages []anthropic.MessageParam) {
+	for i := len(messages) - 1; i >= 0 && i >= len(messages)-2; i-- {
+		msg := &messages[i]
+		if len(msg.Content) == 0 {
+			continue
+		}
+		lastIdx := len(msg.Content) - 1
+		block := &msg.Content[lastIdx]
+		cacheCtrl := anthropic.NewCacheControlEphemeralParam()
+		switch {
+		case block.OfText != nil:
+			block.OfText.CacheControl = cacheCtrl
+		case block.OfToolUse != nil:
+			block.OfToolUse.CacheControl = cacheCtrl
+		case block.OfToolResult != nil:
+			block.OfToolResult.CacheControl = cacheCtrl
+		case block.OfImage != nil:
+			block.OfImage.CacheControl = cacheCtrl
+		case block.OfDocument != nil:
+			block.OfDocument.CacheControl = cacheCtrl
+		}
+	}
 }
 
 // extractSystemBlocks converts any system-role messages into Anthropic system text blocks
@@ -417,6 +537,7 @@ func extractSystemBlocks(messages []chat.Message) []anthropic.TextBlockParam {
 		if msg.Role != chat.MessageRoleSystem {
 			continue
 		}
+
 		if len(msg.MultiContent) > 0 {
 			for _, part := range msg.MultiContent {
 				if part.Type == chat.MessagePartTypeText {
@@ -426,9 +547,16 @@ func extractSystemBlocks(messages []chat.Message) []anthropic.TextBlockParam {
 				}
 			}
 		} else if txt := strings.TrimSpace(msg.Content); txt != "" {
-			systemBlocks = append(systemBlocks, anthropic.TextBlockParam{Text: txt})
+			systemBlocks = append(systemBlocks, anthropic.TextBlockParam{
+				Text: txt,
+			})
+		}
+
+		if msg.CacheControl {
+			systemBlocks[len(systemBlocks)-1].CacheControl = anthropic.NewCacheControlEphemeralParam()
 		}
 	}
+
 	return systemBlocks
 }
 
@@ -549,7 +677,9 @@ func repairAnthropicSequencing(msgs []anthropic.MessageParam) []anthropic.Messag
 	return repaired
 }
 
-// Helpers for map-based inspection
+// marshalToMap is a helper that converts any value to a map[string]any via JSON marshaling.
+// This is used to inspect SDK union types without depending on their internal structure.
+// It's shared by both standard and Beta API validation/repair code.
 func marshalToMap(v any) (map[string]any, bool) {
 	b, err := json.Marshal(v)
 	if err != nil {
@@ -562,6 +692,8 @@ func marshalToMap(v any) (map[string]any, bool) {
 	return m, true
 }
 
+// contentArray extracts the content array from a marshaled message map.
+// Used by both standard and Beta API validation/repair code.
 func contentArray(m map[string]any) []any {
 	if a, ok := m["content"].([]any); ok {
 		return a
@@ -623,9 +755,7 @@ func clampMaxTokens(limit, used, configured int64) int64 {
 	const safety = int64(1024)
 
 	remaining := limit - used - safety
-	if remaining < 1 {
-		remaining = 1
-	}
+	remaining = max(remaining, 1)
 	if configured > remaining {
 		return remaining
 	}
@@ -669,11 +799,4 @@ func countAnthropicTokens(
 		return 0, err
 	}
 	return result.InputTokens, nil
-}
-
-func defaultsTo(value, defaultValue string) string {
-	if value != "" {
-		return value
-	}
-	return defaultValue
 }

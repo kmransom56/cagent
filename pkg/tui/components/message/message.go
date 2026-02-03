@@ -5,10 +5,11 @@ import (
 	"regexp"
 	"strings"
 
-	"charm.land/bubbles/v2/spinner"
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/docker/cagent/pkg/tui/components/markdown"
+	"github.com/docker/cagent/pkg/tui/components/spinner"
 	"github.com/docker/cagent/pkg/tui/core/layout"
 	"github.com/docker/cagent/pkg/tui/styles"
 	"github.com/docker/cagent/pkg/tui/types"
@@ -19,25 +20,30 @@ type Model interface {
 	layout.Model
 	layout.Sizeable
 	SetMessage(msg *types.Message)
+	SetSelected(selected bool)
 }
 
 // messageModel implements Model
 type messageModel struct {
-	message *types.Message
-	width   int
-	height  int
-	focused bool
-	spinner spinner.Model
+	message  *types.Message
+	previous *types.Message
+
+	width    int
+	height   int
+	focused  bool
+	selected bool
+	spinner  spinner.Spinner
 }
 
 // New creates a new message view
-func New(msg *types.Message) *messageModel {
+func New(msg, previous *types.Message) *messageModel {
 	return &messageModel{
-		message: msg,
-		width:   80, // Default width
-		height:  1,  // Will be calculated
-		focused: false,
-		spinner: spinner.New(spinner.WithSpinner(spinner.Points)),
+		message:  msg,
+		previous: previous,
+		width:    80, // Default width
+		height:   1,  // Will be calculated
+		focused:  false,
+		spinner:  spinner.New(spinner.ModeBoth, styles.SpinnerDotsAccentStyle),
 	}
 }
 
@@ -45,8 +51,8 @@ func New(msg *types.Message) *messageModel {
 
 // Init initializes the message view
 func (mv *messageModel) Init() tea.Cmd {
-	if mv.message.Type == types.MessageTypeSpinner {
-		return mv.spinner.Tick
+	if mv.message.Type == types.MessageTypeSpinner || mv.message.Type == types.MessageTypeLoading {
+		return mv.spinner.Init()
 	}
 	return nil
 }
@@ -55,14 +61,17 @@ func (mv *messageModel) SetMessage(msg *types.Message) {
 	mv.message = msg
 }
 
+func (mv *messageModel) SetSelected(selected bool) {
+	mv.selected = selected
+}
+
 // Update handles messages and updates the message view state
 func (mv *messageModel) Update(msg tea.Msg) (layout.Model, tea.Cmd) {
-	if mv.message.Type == types.MessageTypeSpinner {
-		var cmd tea.Cmd
-		mv.spinner, cmd = mv.spinner.Update(msg)
+	if mv.message.Type == types.MessageTypeSpinner || mv.message.Type == types.MessageTypeLoading {
+		s, cmd := mv.spinner.Update(msg)
+		mv.spinner = s.(spinner.Spinner)
 		return mv, cmd
 	}
-
 	return mv, nil
 }
 
@@ -78,58 +87,79 @@ func (mv *messageModel) Render(width int) string {
 	case types.MessageTypeSpinner:
 		return mv.spinner.View()
 	case types.MessageTypeUser:
-		return styles.UserMessageBorderStyle.Width(width - 1).Render(msg.Content)
+		return styles.UserMessageStyle.Width(width).Render(msg.Content)
 	case types.MessageTypeAssistant:
 		if msg.Content == "" {
 			return mv.spinner.View()
 		}
 
-		text := senderPrefix(msg.Sender) + msg.Content
-		rendered, err := markdown.NewRenderer(width).Render(text)
-		if err != nil {
-			return text
+		messageStyle := styles.AssistantMessageStyle
+		if mv.selected {
+			messageStyle = styles.SelectedMessageStyle
 		}
 
-		return strings.TrimRight(rendered, "\n\r\t ")
-	case types.MessageTypeAssistantReasoning:
-		if msg.Content == "" {
-			return mv.spinner.View()
-		}
-		text := "Thinking: " + senderPrefix(msg.Sender) + msg.Content
-		// Render through the markdown renderer to ensure proper wrapping to width
-		rendered, err := markdown.NewRenderer(width).Render(text)
+		rendered, err := markdown.NewRenderer(width - messageStyle.GetHorizontalFrameSize()).Render(msg.Content)
 		if err != nil {
-			return styles.MutedStyle.Italic(true).Render(text)
+			rendered = msg.Content
 		}
-		// Strip ANSI from inner rendering so muted style fully applies
-		clean := stripANSI(strings.TrimRight(rendered, "\n\r\t "))
-		return styles.MutedStyle.Italic(true).Render(clean)
+
+		if mv.sameAgentAsPrevious(msg) {
+			return messageStyle.Render(rendered)
+		}
+
+		return mv.senderPrefix(msg.Sender) + messageStyle.Render(rendered)
 	case types.MessageTypeShellOutput:
 		if rendered, err := markdown.NewRenderer(width).Render(fmt.Sprintf("```console\n%s\n```", msg.Content)); err == nil {
-			return strings.TrimRight(rendered, "\n\r\t ")
+			return rendered
 		}
 		return msg.Content
 	case types.MessageTypeCancelled:
 		return styles.WarningStyle.Render("⚠ stream cancelled ⚠")
 	case types.MessageTypeWelcome:
-		// Render welcome message with a distinct style
-		rendered, err := markdown.NewRenderer(width).Render(msg.Content)
+		messageStyle := styles.WelcomeMessageStyle
+		rendered, err := markdown.NewRenderer(width - messageStyle.GetHorizontalFrameSize()).Render(msg.Content)
 		if err != nil {
-			return styles.MutedStyle.Render(msg.Content)
+			rendered = msg.Content
 		}
-		return styles.MutedStyle.Render(strings.TrimRight(rendered, "\n\r\t "))
+		return messageStyle.Width(width - 1).Render(strings.TrimRight(rendered, "\n\r\t "))
 	case types.MessageTypeError:
-		return styles.ErrorStyle.Render("│ " + msg.Content)
+		return styles.ErrorMessageStyle.Width(width - 1).Render(msg.Content)
+	case types.MessageTypeLoading:
+		// Show spinner with the loading description, truncated to fit width
+		spinnerView := mv.spinner.View()
+		spinnerWidth := ansi.StringWidth(spinnerView) + 1 // +1 for space separator
+		maxDescWidth := width - spinnerWidth
+		description := msg.Content
+		if maxDescWidth > 0 && ansi.StringWidth(description) > maxDescWidth {
+			description = ansi.Truncate(description, maxDescWidth, "…")
+		}
+		return spinnerView + " " + styles.MutedStyle.Render(description)
 	default:
 		return msg.Content
 	}
 }
 
-func senderPrefix(sender string) string {
-	if sender == "" || sender == "root" {
+func (mv *messageModel) senderPrefix(sender string) string {
+	if sender == "" {
 		return ""
 	}
-	return fmt.Sprintf("%s: ", sender)
+	return styles.AgentBadgeStyle.MarginLeft(2).Render(sender) + "\n\n"
+}
+
+// sameAgentAsPrevious returns true if the previous message was from the same agent
+func (mv *messageModel) sameAgentAsPrevious(msg *types.Message) bool {
+	if mv.previous == nil || mv.previous.Sender != msg.Sender {
+		return false
+	}
+	switch mv.previous.Type {
+	case types.MessageTypeAssistant,
+		types.MessageTypeAssistantReasoningBlock,
+		types.MessageTypeToolCall,
+		types.MessageTypeToolResult:
+		return true
+	default:
+		return false
+	}
 }
 
 // Height calculates the height needed for this message view

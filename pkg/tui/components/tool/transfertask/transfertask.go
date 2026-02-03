@@ -2,51 +2,58 @@ package transfertask
 
 import (
 	"encoding/json"
+	"strings"
 
-	tea "charm.land/bubbletea/v2"
-	"github.com/charmbracelet/glamour/v2"
+	"charm.land/lipgloss/v2"
 
 	"github.com/docker/cagent/pkg/tools/builtin"
+	"github.com/docker/cagent/pkg/tui/components/spinner"
+	"github.com/docker/cagent/pkg/tui/components/toolcommon"
 	"github.com/docker/cagent/pkg/tui/core/layout"
 	"github.com/docker/cagent/pkg/tui/service"
 	"github.com/docker/cagent/pkg/tui/styles"
 	"github.com/docker/cagent/pkg/tui/types"
 )
 
-// Component is a specialized component for rendering transfer_task tool calls.
-type Component struct {
-	message  *types.Message
-	renderer *glamour.TermRenderer
+func New(msg *types.Message, sessionState service.SessionStateReader) layout.Model {
+	return toolcommon.NewBase(msg, sessionState, render)
 }
 
-func New(
-	msg *types.Message,
-	renderer *glamour.TermRenderer,
-	_ *service.SessionState,
-) layout.Model {
-	return &Component{
-		message:  msg,
-		renderer: renderer,
-	}
-}
-
-func (c *Component) SetSize(width, height int) tea.Cmd {
-	return nil
-}
-
-func (c *Component) Init() tea.Cmd {
-	return nil
-}
-
-func (c *Component) Update(tea.Msg) (layout.Model, tea.Cmd) {
-	return c, nil
-}
-
-func (c *Component) View() string {
+func render(msg *types.Message, _ spinner.Spinner, _ service.SessionStateReader, width, _ int) string {
 	var params builtin.TransferTaskArgs
-	if err := json.Unmarshal([]byte(c.message.ToolCall.Function.Arguments), &params); err != nil {
-		return "" // TODO: Partial tool call
+	if err := json.Unmarshal([]byte(msg.ToolCall.Function.Arguments), &params); err != nil {
+		return ""
 	}
 
-	return c.message.Sender + " -> " + params.Agent + ": " + styles.MutedStyle.Render(params.Task)
+	header := styles.AgentBadgeStyle.MarginLeft(2).Render(msg.Sender) +
+		" calls " +
+		styles.AgentBadgeStyle.Render(params.Agent)
+
+	// Calculate the icon with its margin
+	icon := styles.ToolCompletedIcon.Render("✓")
+	iconWithSpace := icon + " "
+	iconWidth := lipgloss.Width(iconWithSpace)
+
+	// Calculate available width for task text (accounting for icon width)
+	availableWidth := max(width-iconWidth, 10)
+
+	// Wrap the task text to fit within the available width
+	lines := toolcommon.WrapLines(params.Task, availableWidth)
+
+	// Build the task content with proper indentation for wrapped lines
+	var taskContent strings.Builder
+	for i, line := range lines {
+		if i == 0 {
+			// First line: icon + text
+			taskContent.WriteString(iconWithSpace)
+			taskContent.WriteString(styles.ToolMessageStyle.Render(line))
+		} else {
+			// Subsequent lines: indent to align with first line's text
+			taskContent.WriteString("\n")
+			taskContent.WriteString(strings.Repeat(" ", iconWidth))
+			taskContent.WriteString(styles.ToolMessageStyle.Render(line))
+		}
+	}
+
+	return header + "\n\n" + taskContent.String()
 }

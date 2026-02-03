@@ -57,22 +57,29 @@ func convertBetaMessages(messages []chat.Message) []anthropic.BetaMessageParam {
 								default:
 									mediaType = "image/jpeg"
 								}
-								imageBlockJSON := map[string]any{
-									"type": "image",
-									"source": map[string]any{
-										"type":       "base64",
-										"media_type": mediaType,
-										"data":       base64Data,
+								// Use SDK types directly for better performance (avoids JSON round trip)
+								contentBlocks = append(contentBlocks, anthropic.BetaContentBlockParamUnion{
+									OfImage: &anthropic.BetaImageBlockParam{
+										Source: anthropic.BetaImageBlockParamSourceUnion{
+											OfBase64: &anthropic.BetaBase64ImageSourceParam{
+												Data:      base64Data,
+												MediaType: anthropic.BetaBase64ImageSourceMediaType(mediaType),
+											},
+										},
 									},
-								}
-								jsonBytes, err := json.Marshal(imageBlockJSON)
-								if err == nil {
-									var imageBlock anthropic.BetaContentBlockParamUnion
-									if json.Unmarshal(jsonBytes, &imageBlock) == nil {
-										contentBlocks = append(contentBlocks, imageBlock)
-									}
-								}
+								})
 							}
+						} else if strings.HasPrefix(part.ImageURL.URL, "http://") || strings.HasPrefix(part.ImageURL.URL, "https://") {
+							// Support URL-based images - Anthropic can fetch images directly from URLs
+							contentBlocks = append(contentBlocks, anthropic.BetaContentBlockParamUnion{
+								OfImage: &anthropic.BetaImageBlockParam{
+									Source: anthropic.BetaImageBlockParamSourceUnion{
+										OfURL: &anthropic.BetaURLImageSourceParam{
+											URL: part.ImageURL.URL,
+										},
+									},
+								},
+							})
 						}
 					}
 				}
@@ -178,16 +185,30 @@ func convertBetaMessages(messages []chat.Message) []anthropic.BetaMessageParam {
 			continue
 		}
 	}
+
+	// Add ephemeral cache to last 2 messages' last content block
+	applyBetaMessageCacheControl(betaMessages)
+
 	return betaMessages
 }
 
 // extractBetaSystemBlocks extracts system messages for Beta API format
 func extractBetaSystemBlocks(messages []chat.Message) []anthropic.BetaTextBlockParam {
 	regularBlocks := extractSystemBlocks(messages)
+
 	betaBlocks := make([]anthropic.BetaTextBlockParam, len(regularBlocks))
 	for i, block := range regularBlocks {
 		betaBlocks[i] = anthropic.BetaTextBlockParam{Text: block.Text}
+
+		// Copy over cache control from regular blocks (already set on first 2)
+		if block.CacheControl.Type != "" {
+			betaBlocks[i].CacheControl = anthropic.BetaCacheControlEphemeralParam{
+				Type: block.CacheControl.Type,
+				TTL:  anthropic.BetaCacheControlEphemeralTTL(block.CacheControl.TTL),
+			}
+		}
 	}
+
 	return betaBlocks
 }
 
@@ -218,4 +239,30 @@ func convertBetaTools(t []tools.Tool) ([]anthropic.BetaToolUnionParam, error) {
 	}
 
 	return betaTools, nil
+}
+
+// applyBetaMessageCacheControl adds ephemeral cache control to the last content block
+// of the last 2 messages for prompt caching.
+func applyBetaMessageCacheControl(messages []anthropic.BetaMessageParam) {
+	for i := len(messages) - 1; i >= 0 && i >= len(messages)-2; i-- {
+		msg := &messages[i]
+		if len(msg.Content) == 0 {
+			continue
+		}
+		lastIdx := len(msg.Content) - 1
+		block := &msg.Content[lastIdx]
+		cacheCtrl := anthropic.NewBetaCacheControlEphemeralParam()
+		switch {
+		case block.OfText != nil:
+			block.OfText.CacheControl = cacheCtrl
+		case block.OfToolUse != nil:
+			block.OfToolUse.CacheControl = cacheCtrl
+		case block.OfToolResult != nil:
+			block.OfToolResult.CacheControl = cacheCtrl
+		case block.OfImage != nil:
+			block.OfImage.CacheControl = cacheCtrl
+		case block.OfDocument != nil:
+			block.OfDocument.CacheControl = cacheCtrl
+		}
+	}
 }

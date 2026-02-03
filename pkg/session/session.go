@@ -10,11 +10,19 @@ import (
 
 	"github.com/docker/cagent/pkg/agent"
 	"github.com/docker/cagent/pkg/chat"
+	"github.com/docker/cagent/pkg/skills"
+	"github.com/docker/cagent/pkg/tools"
 )
 
-// TODO: instead of trimming, we should compact the history when it nears the
-// context size of the current LLM
-var maxMessages = 100 // Maximum number of messages to keep in context
+const (
+	// MaxToolCallTokens is the maximum number of tokens to keep from tool call
+	// arguments and results. Older tool calls beyond this budget will have their
+	// content replaced with a placeholder. Tokens are approximated as len/4.
+	MaxToolCallTokens = 40000
+
+	// toolContentPlaceholder is the text used to replace truncated tool content
+	toolContentPlaceholder = "[content truncated]"
+)
 
 // Item represents either a message or a sub-session
 type Item struct {
@@ -55,6 +63,15 @@ type Session struct {
 	// ToolsApproved is a flag to indicate if the tools have been approved
 	ToolsApproved bool `json:"tools_approved"`
 
+	// Thinking is a session-level flag to enable thinking/interleaved thinking
+	// defaults for all providers. When false, providers will not apply auto-thinking budgets
+	// or interleaved thinking, regardless of model config. This is controlled by the /think
+	// command in the TUI. Defaults to true (thinking enabled).
+	Thinking bool `json:"thinking"`
+
+	// HideToolResults is a flag to indicate if tool results should be hidden
+	HideToolResults bool `json:"hide_tool_results"`
+
 	// WorkingDir is the base directory used for filesystem-aware tools
 	WorkingDir string `json:"working_dir,omitempty"`
 
@@ -65,73 +82,93 @@ type Session struct {
 	// If 0, there is no limit
 	MaxIterations int `json:"max_iterations"`
 
-	InputTokens  int     `json:"input_tokens"`
-	OutputTokens int     `json:"output_tokens"`
+	// Starred indicates if this session has been starred by the user
+	Starred bool `json:"starred"`
+
+	InputTokens  int64   `json:"input_tokens"`
+	OutputTokens int64   `json:"output_tokens"`
 	Cost         float64 `json:"cost"`
+
+	// Permissions holds session-level permission overrides.
+	// When set, these are evaluated before team-level permissions.
+	Permissions *PermissionsConfig `json:"permissions,omitempty"`
+
+	// AgentModelOverrides stores per-agent model overrides for this session.
+	// Key is the agent name, value is the model reference (e.g., "openai/gpt-4o" or a named model from config).
+	// When a session is loaded, these overrides are reapplied to the runtime.
+	AgentModelOverrides map[string]string `json:"agent_model_overrides,omitempty"`
+
+	// CustomModelsUsed tracks custom models (provider/model format) used during this session.
+	// These are shown in the model picker for easy re-selection.
+	CustomModelsUsed []string `json:"custom_models_used,omitempty"`
+
+	// ParentID indicates this is a sub-session created by task transfer.
+	// Sub-sessions are not persisted as standalone entries; they are embedded
+	// within the parent session's Messages array.
+	ParentID string `json:"-"`
+
+	// MessageUsageHistory stores per-message usage data for remote mode.
+	// In remote mode, messages are managed server-side, so we track usage separately.
+	// This is not persisted (json:"-") as it's only needed for the current session display.
+	MessageUsageHistory []MessageUsageRecord `json:"-"`
+}
+
+// MessageUsageRecord stores usage data for a single assistant message.
+// Used in remote mode where messages aren't stored in the client-side session.
+type MessageUsageRecord struct {
+	AgentName string     `json:"agent_name"`
+	Model     string     `json:"model"`
+	Cost      float64    `json:"cost"`
+	Usage     chat.Usage `json:"usage"`
+}
+
+// PermissionsConfig defines session-level tool permission overrides
+// using pattern-based rules (Allow/Deny arrays).
+type PermissionsConfig struct {
+	// Allow lists tool name patterns that are auto-approved without user confirmation.
+	Allow []string `json:"allow,omitempty"`
+	// Deny lists tool name patterns that are always rejected.
+	Deny []string `json:"deny,omitempty"`
 }
 
 // Message is a message from an agent
 type Message struct {
-	AgentFilename string       `json:"agentFilename"`
-	AgentName     string       `json:"agentName"` // TODO: rename to agent_name
-	Message       chat.Message `json:"message"`
+	// ID is the database ID of the message (used for persistence tracking)
+	ID        int64        `json:"-"`
+	AgentName string       `json:"agentName"` // TODO: rename to agent_name
+	Message   chat.Message `json:"message"`
 	// Implicit is an optional field to indicate if the message shouldn't be shown to the user. It's needed for special  situations
 	// like when an agent transfers a task to another agent - new session is created with a default user message, but this shouldn't be shown to the user.
 	// Such messages should be marked as true
 	Implicit bool `json:"implicit,omitempty"`
 }
 
-func ImplicitUserMessage(agentFilename, content string) *Message {
-	return &Message{
-		AgentFilename: agentFilename,
-		AgentName:     "",
-		Message: chat.Message{
-			Role:      chat.MessageRoleUser,
-			Content:   content,
-			CreatedAt: time.Now().Format(time.RFC3339),
-		},
-		Implicit: true,
-	}
+func ImplicitUserMessage(content string) *Message {
+	msg := UserMessage(content)
+	msg.Implicit = true
+	return msg
 }
 
-func UserMessage(agentFilename, content string, multiContent ...chat.MessagePart) *Message {
-	var msg chat.Message
-
-	if len(multiContent) > 0 {
-		msg = chat.Message{
+func UserMessage(content string, multiContent ...chat.MessagePart) *Message {
+	return &Message{
+		Message: chat.Message{
 			Role:         chat.MessageRoleUser,
-			Content:      "",
+			Content:      content,
 			MultiContent: multiContent,
 			CreatedAt:    time.Now().Format(time.RFC3339),
-		}
-	} else {
-		// Otherwise, use plain text content
-		msg = chat.Message{
-			Role:      chat.MessageRoleUser,
-			Content:   content,
-			CreatedAt: time.Now().Format(time.RFC3339),
-		}
-	}
-
-	return &Message{
-		AgentFilename: agentFilename,
-		AgentName:     "",
-		Message:       msg,
+		},
 	}
 }
 
 func NewAgentMessage(a *agent.Agent, message *chat.Message) *Message {
 	return &Message{
-		AgentFilename: "",
-		AgentName:     a.Name(),
-		Message:       *message,
+		AgentName: a.Name(),
+		Message:   *message,
 	}
 }
 
 func SystemMessage(content string) *Message {
 	return &Message{
-		AgentFilename: "",
-		AgentName:     "",
 		Message: chat.Message{
 			Role:      chat.MessageRoleSystem,
 			Content:   content,
@@ -164,6 +201,26 @@ func (s *Session) AddSubSession(subSession *Session) {
 	s.Messages = append(s.Messages, NewSubSessionItem(subSession))
 }
 
+// Duration calculates the duration of the session from message timestamps.
+func (s *Session) Duration() time.Duration {
+	messages := s.GetAllMessages()
+	if len(messages) < 2 {
+		return 0
+	}
+
+	first, err := time.Parse(time.RFC3339, messages[0].Message.CreatedAt)
+	if err != nil {
+		return 0
+	}
+
+	last, err := time.Parse(time.RFC3339, messages[len(messages)-1].Message.CreatedAt)
+	if err != nil {
+		return 0
+	}
+
+	return last.Sub(first)
+}
+
 // AllowedDirectories returns the directories that should be considered safe for tools
 func (s *Session) AllowedDirectories() []string {
 	if s.WorkingDir == "" {
@@ -188,26 +245,81 @@ func (s *Session) GetAllMessages() []Message {
 }
 
 func (s *Session) GetLastAssistantMessageContent() string {
+	return s.getLastMessageContentByRole(chat.MessageRoleAssistant)
+}
+
+func (s *Session) GetLastUserMessageContent() string {
+	return s.getLastMessageContentByRole(chat.MessageRoleUser)
+}
+
+// GetLastUserMessages returns up to n most recent user messages, ordered from oldest to newest.
+func (s *Session) GetLastUserMessages(n int) []string {
+	messages := s.GetAllMessages()
+	var userMessages []string
+	for i := range messages {
+		if messages[i].Message.Role == chat.MessageRoleUser {
+			content := strings.TrimSpace(messages[i].Message.Content)
+			if content != "" {
+				userMessages = append(userMessages, content)
+			}
+		}
+	}
+	if len(userMessages) <= n {
+		return userMessages
+	}
+	return userMessages[len(userMessages)-n:]
+}
+
+func (s *Session) getLastMessageContentByRole(role chat.MessageRole) string {
 	messages := s.GetAllMessages()
 	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Message.Role == chat.MessageRoleAssistant {
+		if messages[i].Message.Role == role {
 			return strings.TrimSpace(messages[i].Message.Content)
 		}
 	}
 	return ""
 }
 
-type Opt func(s *Session)
-
-func WithUserMessage(agentFilename, content string) Opt {
-	return func(s *Session) {
-		s.AddMessage(UserMessage(agentFilename, content))
+// UpdateLastAssistantMessageUsage updates the usage and cost fields of the last assistant message.
+// This is used in remote mode to populate per-message cost data from TokenUsageEvent.
+func (s *Session) UpdateLastAssistantMessageUsage(usage *chat.Usage, cost float64, model string) {
+	for i := len(s.Messages) - 1; i >= 0; i-- {
+		if s.Messages[i].IsMessage() && s.Messages[i].Message.Message.Role == chat.MessageRoleAssistant {
+			s.Messages[i].Message.Message.Usage = usage
+			s.Messages[i].Message.Message.Cost = cost
+			if model != "" {
+				s.Messages[i].Message.Message.Model = model
+			}
+			return
+		}
 	}
 }
 
-func WithImplicitUserMessage(agentFilename, content string) Opt {
+// AddMessageUsageRecord appends a usage record for remote mode where messages aren't stored locally.
+// This enables the /cost dialog to show per-message breakdown even when using a remote runtime.
+func (s *Session) AddMessageUsageRecord(agentName, model string, cost float64, usage *chat.Usage) {
+	if usage == nil {
+		return
+	}
+	s.MessageUsageHistory = append(s.MessageUsageHistory, MessageUsageRecord{
+		AgentName: agentName,
+		Model:     model,
+		Cost:      cost,
+		Usage:     *usage,
+	})
+}
+
+type Opt func(s *Session)
+
+func WithUserMessage(content string) Opt {
 	return func(s *Session) {
-		s.AddMessage(ImplicitUserMessage(agentFilename, content))
+		s.AddMessage(UserMessage(content))
+	}
+}
+
+func WithImplicitUserMessage(content string) Opt {
+	return func(s *Session) {
+		s.AddMessage(ImplicitUserMessage(content))
 	}
 }
 
@@ -241,10 +353,41 @@ func WithToolsApproved(toolsApproved bool) Opt {
 	}
 }
 
+func WithThinking(thinking bool) Opt {
+	return func(s *Session) {
+		s.Thinking = thinking
+	}
+}
+
+func WithHideToolResults(hideToolResults bool) Opt {
+	return func(s *Session) {
+		s.HideToolResults = hideToolResults
+	}
+}
+
 func WithSendUserMessage(sendUserMessage bool) Opt {
 	return func(s *Session) {
 		s.SendUserMessage = sendUserMessage
 	}
+}
+
+func WithPermissions(perms *PermissionsConfig) Opt {
+	return func(s *Session) {
+		s.Permissions = perms
+	}
+}
+
+// WithParentID marks this session as a sub-session of the given parent.
+// Sub-sessions are not persisted as standalone entries in the session store.
+func WithParentID(parentID string) Opt {
+	return func(s *Session) {
+		s.ParentID = parentID
+	}
+}
+
+// IsSubSession returns true if this session is a sub-session (has a parent).
+func (s *Session) IsSubSession() bool {
+	return s.ParentID != ""
 }
 
 // New creates a new agent session
@@ -256,6 +399,7 @@ func New(opts ...Opt) *Session {
 		ID:              sessionID,
 		CreatedAt:       time.Now(),
 		SendUserMessage: true,
+		Thinking:        false,
 	}
 
 	for _, opt := range opts {
@@ -265,31 +409,106 @@ func New(opts ...Opt) *Session {
 	return s
 }
 
-func (s *Session) GetMessages(a *agent.Agent) []chat.Message {
-	slog.Debug("Getting messages for agent", "agent", a.Name(), "session_id", s.ID)
+func markLastMessageAsCacheControl(messages []chat.Message) {
+	if len(messages) > 0 {
+		messages[len(messages)-1].CacheControl = true
+	}
+}
 
+// buildInvariantSystemMessages builds system messages that are identical
+// for all users of a given agent configuration. These messages can be
+// cached efficiently as they don't change between sessions, users, or projects.
+//
+// These messages are determined solely by the agent configuration and
+// remain constant across different sessions, users, and working directories.
+func buildInvariantSystemMessages(a *agent.Agent) []chat.Message {
 	var messages []chat.Message
 
 	if a.HasSubAgents() {
 		subAgents := append(a.SubAgents(), a.Parents()...)
 
-		subAgentsStr := ""
+		var text strings.Builder
 		var validAgentIDs []string
 		for _, subAgent := range subAgents {
-			subAgentsStr += "ID: " + subAgent.Name() + " | Name: " + subAgent.Name() + " | Description: " + subAgent.Description() + "\n"
+			text.WriteString("Name: ")
+			text.WriteString(subAgent.Name())
+			text.WriteString(" | Description: ")
+			text.WriteString(subAgent.Description())
+			text.WriteString("\n")
+
 			validAgentIDs = append(validAgentIDs, subAgent.Name())
 		}
 
 		messages = append(messages, chat.Message{
 			Role:    chat.MessageRoleSystem,
-			Content: "You are a multi-agent system, make sure to answer the user query in the most helpful way possible. You have access to these sub-agents:\n" + subAgentsStr + "\nIMPORTANT: You can ONLY transfer tasks to the agents listed above using their ID. The valid agent IDs are: " + strings.Join(validAgentIDs, ", ") + ". You MUST NOT attempt to transfer to any other agent IDs - doing so will cause system errors.\n\nIf you are the best to answer the question according to your description, you can answer it.\n\nIf another agent is better for answering the question according to its description, call `transfer_task` function to transfer the question to that agent using the agent's ID. When transferring, do not generate any text other than the function call.\n\n",
+			Content: "You are a multi-agent system, make sure to answer the user query in the most helpful way possible. You have access to these sub-agents:\n" + text.String() + "\nIMPORTANT: You can ONLY transfer tasks to the agents listed above using their ID. The valid agent names are: " + strings.Join(validAgentIDs, ", ") + ". You MUST NOT attempt to transfer to any other agent IDs - doing so will cause system errors.\n\nIf you are the best to answer the question according to your description, you can answer it.\n\nIf another agent is better for answering the question according to its description, call `transfer_task` function to transfer the question to that agent using the agent's ID. When transferring, do not generate any text other than the function call.\n\n",
 		})
 	}
 
-	content := a.Instruction()
+	if handoffs := a.Handoffs(); len(handoffs) > 0 {
+		var text strings.Builder
+		var validAgentIDs []string
+		for _, agent := range handoffs {
+			text.WriteString("Name: ")
+			text.WriteString(agent.Name())
+			text.WriteString(" | Description: ")
+			text.WriteString(agent.Description())
+			text.WriteString("\n")
+
+			validAgentIDs = append(validAgentIDs, agent.Name())
+		}
+
+		handoffPrompt := "You are part of a multi-agent team. Your goal is to answer the user query in the most helpful way possible.\n\n" +
+			"Available agents in your team:\n" + text.String() + "\n" +
+			"You can hand off the conversation to any of these agents at any time by using the `handoff` function with their ID. " +
+			"The valid agent IDs are: " + strings.Join(validAgentIDs, ", ") + ".\n\n" +
+			"When to hand off:\n" +
+			"- If another agent's description indicates they are better suited for the current task or question\n" +
+			"- If the user explicitly asks for a specific agent\n" +
+			"- If you need specialized capabilities that another agent provides\n\n" +
+			"If you are the best agent to handle the current request based on your capabilities, respond directly. " +
+			"When handing off to another agent, only handoff without talking about the handoff."
+
+		messages = append(messages, chat.Message{
+			Role:    chat.MessageRoleSystem,
+			Content: handoffPrompt,
+		})
+	}
+
+	if instructions := a.Instruction(); instructions != "" {
+		messages = append(messages, chat.Message{
+			Role:    chat.MessageRoleSystem,
+			Content: instructions,
+		})
+	}
+
+	for _, toolSet := range a.ToolSets() {
+		if instructions := tools.GetInstructions(toolSet); instructions != "" {
+			messages = append(messages, chat.Message{
+				Role:    chat.MessageRoleSystem,
+				Content: instructions,
+			})
+		}
+	}
+
+	return messages
+}
+
+// buildContextSpecificSystemMessages builds system messages that vary
+// per user, project, or time. These messages should come after
+// the invariant checkpoint to maintain optimal caching behavior.
+//
+// These messages depend on runtime context (working directory, current date,
+// user-specific skills) and cannot be cached across sessions or users.
+// Note: Session summary is handled separately in buildSessionSummaryMessages.
+func buildContextSpecificSystemMessages(a *agent.Agent, s *Session) []chat.Message {
+	var messages []chat.Message
 
 	if a.AddDate() {
-		content += "\n\n" + "Today's date: " + time.Now().Format("2006-01-02")
+		messages = append(messages, chat.Message{
+			Role:    chat.MessageRoleSystem,
+			Content: "Today's date: " + time.Now().Format("2006-01-02"),
+		})
 	}
 
 	wd := s.WorkingDir
@@ -302,36 +521,49 @@ func (s *Session) GetMessages(a *agent.Agent) []chat.Message {
 	}
 	if wd != "" {
 		if a.AddEnvironmentInfo() {
-			content += "\n\n" + getEnvironmentInfo(wd)
+			messages = append(messages, chat.Message{
+				Role:    chat.MessageRoleSystem,
+				Content: getEnvironmentInfo(wd),
+			})
 		}
 
 		for _, prompt := range a.AddPromptFiles() {
-			additionalPrompt, err := readPromptFile(wd, prompt)
+			additionalPrompts, err := readPromptFiles(wd, prompt)
 			if err != nil {
 				slog.Error("reading prompt file", "file", prompt, "error", err)
 				continue
 			}
 
-			if additionalPrompt == "" {
-				content += "\n\n" + additionalPrompt
+			for _, additionalPrompt := range additionalPrompts {
+				messages = append(messages, chat.Message{
+					Role:    chat.MessageRoleSystem,
+					Content: additionalPrompt,
+				})
 			}
 		}
 	}
 
-	messages = append(messages, chat.Message{
-		Role:    chat.MessageRoleSystem,
-		Content: content,
-	})
-
-	for _, tool := range a.ToolSets() {
-		if tool.Instructions() != "" {
+	// Add skills section if enabled
+	if a.SkillsEnabled() {
+		if loadedSkills := skills.Load(); len(loadedSkills) > 0 {
 			messages = append(messages, chat.Message{
 				Role:    chat.MessageRoleSystem,
-				Content: tool.Instructions(),
+				Content: skills.BuildSkillsPrompt(loadedSkills),
 			})
 		}
 	}
 
+	return messages
+}
+
+// buildSessionSummaryMessages builds system messages containing the session summary
+// if one exists. Session summaries are context-specific per session and thus should not have a checkpoint (they will be cached alongside the first user message anyway)
+//
+// lastSummaryIndex is the index of the last summary item in s.Messages, or -1 if none exists.
+func buildSessionSummaryMessages(s *Session) ([]chat.Message, int) {
+	var messages []chat.Message
+	// Find the last summary index to determine where conversation messages start
+	// and to include the summary in session summary messages
 	lastSummaryIndex := -1
 	for i := len(s.Messages) - 1; i >= 0; i-- {
 		if s.Messages[i].Summary != "" {
@@ -340,7 +572,7 @@ func (s *Session) GetMessages(a *agent.Agent) []chat.Message {
 		}
 	}
 
-	if lastSummaryIndex != -1 {
+	if lastSummaryIndex >= 0 && lastSummaryIndex < len(s.Messages) {
 		messages = append(messages, chat.Message{
 			Role:      chat.MessageRoleSystem,
 			Content:   "Session Summary: " + s.Messages[lastSummaryIndex].Summary,
@@ -348,11 +580,31 @@ func (s *Session) GetMessages(a *agent.Agent) []chat.Message {
 		})
 	}
 
-	startIndex := lastSummaryIndex + 1
-	if lastSummaryIndex == -1 {
-		startIndex = 0
-	}
+	return messages, lastSummaryIndex
+}
 
+func (s *Session) GetMessages(a *agent.Agent) []chat.Message {
+	slog.Debug("Getting messages for agent", "agent", a.Name(), "session_id", s.ID)
+
+	// Build invariant system messages (cacheable across sessions/users/projects)
+	invariantMessages := buildInvariantSystemMessages(a)
+	markLastMessageAsCacheControl(invariantMessages)
+
+	// Build context-specific system messages (vary per user/project/time)
+	contextMessages := buildContextSpecificSystemMessages(a, s)
+	markLastMessageAsCacheControl(contextMessages)
+
+	// Build session summary messages (vary per session)
+	summaryMessages, lastSummaryIndex := buildSessionSummaryMessages(s)
+
+	var messages []chat.Message
+	messages = append(messages, invariantMessages...)
+	messages = append(messages, contextMessages...)
+	messages = append(messages, summaryMessages...)
+
+	startIndex := lastSummaryIndex + 1
+
+	// Begin adding conversation messages
 	for i := startIndex; i < len(s.Messages); i++ {
 		item := s.Messages[i]
 		if item.IsMessage() {
@@ -361,16 +613,16 @@ func (s *Session) GetMessages(a *agent.Agent) []chat.Message {
 	}
 
 	maxItems := a.NumHistoryItems()
-	if maxItems <= 0 {
-		maxItems = maxMessages
+	if maxItems > 0 {
+		messages = trimMessages(messages, maxItems)
 	}
 
-	trimmed := trimMessages(messages, maxItems)
+	messages = truncateOldToolContent(messages, MaxToolCallTokens)
 
 	systemCount := 0
 	conversationCount := 0
-	for i := range trimmed {
-		if trimmed[i].Role == chat.MessageRoleSystem {
+	for i := range messages {
+		if messages[i].Role == chat.MessageRoleSystem {
 			systemCount++
 		} else {
 			conversationCount++
@@ -381,29 +633,11 @@ func (s *Session) GetMessages(a *agent.Agent) []chat.Message {
 		"agent", a.Name(),
 		"session_id", s.ID,
 		"total_messages", len(messages),
-		"trimmed_total", len(trimmed),
 		"system_messages", systemCount,
 		"conversation_messages", conversationCount,
 		"max_history_items", maxItems)
 
-	return trimmed
-}
-
-func (s *Session) GetMostRecentAgentFilename() string {
-	// Check items in reverse order
-	for i := len(s.Messages) - 1; i >= 0; i-- {
-		item := s.Messages[i]
-		if item.IsMessage() {
-			if agentFilename := item.Message.AgentFilename; agentFilename != "" {
-				return agentFilename
-			}
-		} else if item.IsSubSession() {
-			if filename := item.SubSession.GetMostRecentAgentFilename(); filename != "" {
-				return filename
-			}
-		}
-	}
-	return ""
+	return messages
 }
 
 // trimMessages ensures we don't exceed the maximum number of messages while maintaining
@@ -459,6 +693,37 @@ func trimMessages(messages []chat.Message, maxItems int) []chat.Message {
 		}
 
 		result = append(result, msg)
+	}
+
+	return result
+}
+
+// truncateOldToolContent replaces tool results with placeholders for older
+// messages that exceed the token budget. It processes messages from newest to
+// oldest, keeping recent tool content intact while truncating older content
+// once the budget is exhausted.
+func truncateOldToolContent(messages []chat.Message, maxTokens int) []chat.Message {
+	if len(messages) == 0 || maxTokens <= 0 {
+		return messages
+	}
+
+	result := make([]chat.Message, len(messages))
+	copy(result, messages)
+
+	tokenBudget := maxTokens
+
+	for i := len(result) - 1; i >= 0; i-- {
+		msg := &result[i]
+
+		if msg.Role == chat.MessageRoleTool {
+			tokens := len(msg.Content) / 4
+			if tokenBudget >= tokens {
+				tokenBudget -= tokens
+			} else {
+				msg.Content = toolContentPlaceholder
+				tokenBudget = 0
+			}
+		}
 	}
 
 	return result

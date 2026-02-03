@@ -13,7 +13,7 @@ func newFeedbackCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "feedback",
 		Short: "Send feedback about cagent",
-		Long:  `Submit feedback or report issues with cagent`,
+		Long:  "Submit feedback or report issues with cagent",
 		Args:  cobra.NoArgs,
 		RunE:  runFeedbackCommand,
 	}
@@ -22,6 +22,6 @@ func newFeedbackCmd() *cobra.Command {
 func runFeedbackCommand(cmd *cobra.Command, args []string) error {
 	telemetry.TrackCommand("feedback", args)
 
-	fmt.Fprintln(cmd.OutOrStdout(), "Feel free to give feedback:\n", feedback.FeedbackLink)
+	fmt.Fprintln(cmd.OutOrStdout(), "Feel free to give feedback:\n", feedback.Link)
 	return nil
 }

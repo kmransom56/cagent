@@ -18,15 +18,15 @@ type remoteMCPClient struct {
 	url                 string
 	transportType       string
 	headers             map[string]string
-	redirectURI         string
 	tokenStore          OAuthTokenStore
 	elicitationHandler  tools.ElicitationHandler
 	oauthSuccessHandler func()
+	managed             bool
 	mu                  sync.RWMutex
 }
 
-func newRemoteClient(url, transportType string, headers map[string]string, redirectURI string, tokenStore OAuthTokenStore) *remoteMCPClient {
-	slog.Debug("Creating remote MCP client", "url", url, "transport", transportType, "headers", headers, "redirectURI", redirectURI)
+func newRemoteClient(url, transportType string, headers map[string]string, tokenStore OAuthTokenStore) *remoteMCPClient {
+	slog.Debug("Creating remote MCP client", "url", url, "transport", transportType, "headers", headers)
 
 	if tokenStore == nil {
 		tokenStore = NewInMemoryTokenStore()
@@ -36,8 +36,8 @@ func newRemoteClient(url, transportType string, headers map[string]string, redir
 		url:           url,
 		transportType: transportType,
 		headers:       headers,
-		redirectURI:   redirectURI,
 		tokenStore:    tokenStore,
+		managed:       false,
 	}
 }
 
@@ -71,7 +71,7 @@ func (c *remoteMCPClient) handleElicitationRequest(ctx context.Context, req *mcp
 	}
 
 	return &mcp.ElicitResult{
-		Action:  result.Action,
+		Action:  string(result.Action),
 		Content: result.Content,
 	}, nil
 }
@@ -90,8 +90,9 @@ func (c *remoteMCPClient) Initialize(ctx context.Context, _ *mcp.InitializeReque
 		}
 	case "streamable", "streamable-http":
 		transport = &mcp.StreamableClientTransport{
-			Endpoint:   c.url,
-			HTTPClient: httpClient,
+			Endpoint:             c.url,
+			HTTPClient:           httpClient,
+			DisableStandaloneSSE: true,
 		}
 	default:
 		return nil, fmt.Errorf("unsupported transport type: %s", c.transportType)
@@ -123,15 +124,47 @@ func (c *remoteMCPClient) Initialize(ctx context.Context, _ *mcp.InitializeReque
 	return session.InitializeResult(), nil
 }
 
-// createHTTPClient creates an HTTP client with OAuth support
+// headerTransport is a RoundTripper that adds custom headers to all requests
+type headerTransport struct {
+	base    http.RoundTripper
+	headers map[string]string
+}
+
+func (t *headerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Clone the request to avoid modifying the original
+	req = req.Clone(req.Context())
+
+	// Add custom headers
+	for key, value := range t.headers {
+		req.Header.Set(key, value)
+	}
+
+	return t.base.RoundTrip(req)
+}
+
+// createHTTPClient creates an HTTP client with custom headers and OAuth support
 func (c *remoteMCPClient) createHTTPClient() *http.Client {
+	transport := http.DefaultTransport
+
+	// Add custom headers first
+	if len(c.headers) > 0 {
+		transport = &headerTransport{
+			base:    transport,
+			headers: c.headers,
+		}
+	}
+
+	// Then wrap with OAuth support
+	transport = &oauthTransport{
+		base:       transport,
+		client:     c,
+		tokenStore: c.tokenStore,
+		baseURL:    c.url,
+		managed:    c.managed,
+	}
+
 	return &http.Client{
-		Transport: &oauthTransport{
-			base:       http.DefaultTransport,
-			client:     c,
-			tokenStore: c.tokenStore,
-			baseURL:    c.url,
-		},
+		Transport: transport,
 	}
 }
 
@@ -172,23 +205,32 @@ func (c *remoteMCPClient) CallTool(ctx context.Context, params *mcp.CallToolPara
 	return session.CallTool(ctx, params)
 }
 
-// requestUserConsent requests user consent to start the OAuth flow via elicitation
-func (c *remoteMCPClient) requestUserConsent(ctx context.Context) (bool, error) {
-	result, err := c.requestElicitation(ctx, &mcp.ElicitParams{
-		Message:         fmt.Sprintf("The MCP server at %s requires OAuth authorization. Do you want to proceed?", c.url),
-		RequestedSchema: nil,
-		Meta: map[string]any{
-			"cagent/type":       "oauth_consent",
-			"cagent/server_url": c.url,
-		},
-	})
-	if err != nil {
-		return false, err
+// ListPrompts retrieves available prompts from the remote MCP server
+func (c *remoteMCPClient) ListPrompts(ctx context.Context, request *mcp.ListPromptsParams) iter.Seq2[*mcp.Prompt, error] {
+	c.mu.RLock()
+	session := c.session
+	c.mu.RUnlock()
+
+	if session == nil {
+		return func(yield func(*mcp.Prompt, error) bool) {
+			yield(nil, fmt.Errorf("session not initialized"))
+		}
 	}
 
-	slog.Debug("Elicitation response received", "result", result)
+	return session.Prompts(ctx, request)
+}
 
-	return result.Action == "accept", nil
+// GetPrompt retrieves a specific prompt with arguments from the remote MCP server
+func (c *remoteMCPClient) GetPrompt(ctx context.Context, request *mcp.GetPromptParams) (*mcp.GetPromptResult, error) {
+	c.mu.RLock()
+	session := c.session
+	c.mu.RUnlock()
+
+	if session == nil {
+		return nil, fmt.Errorf("session not initialized")
+	}
+
+	return session.GetPrompt(ctx, request)
 }
 
 // SetElicitationHandler sets the elicitation handler for remote MCP clients
@@ -202,5 +244,13 @@ func (c *remoteMCPClient) SetElicitationHandler(handler tools.ElicitationHandler
 func (c *remoteMCPClient) SetOAuthSuccessHandler(handler func()) {
 	c.mu.Lock()
 	c.oauthSuccessHandler = handler
+	c.mu.Unlock()
+}
+
+// SetManagedOAuth sets whether OAuth should be handled in managed mode
+// In managed mode, the client handles the OAuth flow instead of the server
+func (c *remoteMCPClient) SetManagedOAuth(managed bool) {
+	c.mu.Lock()
+	c.managed = managed
 	c.mu.Unlock()
 }

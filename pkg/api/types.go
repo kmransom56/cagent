@@ -4,7 +4,7 @@ import (
 	"time"
 
 	"github.com/docker/cagent/pkg/chat"
-	v2 "github.com/docker/cagent/pkg/config/v2"
+	"github.com/docker/cagent/pkg/config/latest"
 	"github.com/docker/cagent/pkg/session"
 )
 
@@ -47,8 +47,8 @@ type CreateAgentConfigResponse struct {
 
 // EditAgentConfigRequest represents a request to edit an agent config
 type EditAgentConfigRequest struct {
-	AgentConfig v2.Config `json:"agent_config"`
-	Filename    string    `json:"filename"`
+	AgentConfig latest.Config `json:"agent_config"`
+	Filename    string        `json:"filename"`
 }
 
 // EditAgentConfigResponse represents the response from editing an agent config
@@ -115,39 +115,38 @@ type DeleteAgentResponse struct {
 
 // SessionsResponse represents a session in the sessions list
 type SessionsResponse struct {
-	ID                         string `json:"id"`
-	Title                      string `json:"title"`
-	CreatedAt                  string `json:"created_at"`
-	NumMessages                int    `json:"num_messages"`
-	InputTokens                int    `json:"input_tokens"`
-	OutputTokens               int    `json:"output_tokens"`
-	GetMostRecentAgentFilename string `json:"most_recent_agent_filename"`
-	WorkingDir                 string `json:"working_dir,omitempty"`
+	ID           string `json:"id"`
+	Title        string `json:"title"`
+	CreatedAt    string `json:"created_at"`
+	NumMessages  int    `json:"num_messages"`
+	InputTokens  int64  `json:"input_tokens"`
+	OutputTokens int64  `json:"output_tokens"`
+	WorkingDir   string `json:"working_dir,omitempty"`
 }
 
 // SessionResponse represents a detailed session
 type SessionResponse struct {
-	ID            string              `json:"id"`
-	Title         string              `json:"title"`
-	Messages      []session.Message   `json:"messages,omitempty"`
-	CreatedAt     time.Time           `json:"created_at"`
-	ToolsApproved bool                `json:"tools_approved"`
-	InputTokens   int                 `json:"input_tokens"`
-	OutputTokens  int                 `json:"output_tokens"`
-	WorkingDir    string              `json:"working_dir,omitempty"`
-	Pagination    *PaginationMetadata `json:"pagination,omitempty"`
+	ID            string                     `json:"id"`
+	Title         string                     `json:"title"`
+	Messages      []session.Message          `json:"messages,omitempty"`
+	CreatedAt     time.Time                  `json:"created_at"`
+	ToolsApproved bool                       `json:"tools_approved"`
+	Thinking      bool                       `json:"thinking"`
+	InputTokens   int64                      `json:"input_tokens"`
+	OutputTokens  int64                      `json:"output_tokens"`
+	WorkingDir    string                     `json:"working_dir,omitempty"`
+	Permissions   *session.PermissionsConfig `json:"permissions,omitempty"`
 }
 
-// PaginationMetadata contains pagination information
-type PaginationMetadata struct {
-	TotalMessages int    `json:"total_messages"`        // Total number of messages in session
-	Limit         int    `json:"limit"`                 // Number of messages in this response
-	PrevCursor    string `json:"prev_cursor,omitempty"` // Cursor for previous page (empty if no more messages)
+// UpdateSessionPermissionsRequest represents a request to update session permissions.
+type UpdateSessionPermissionsRequest struct {
+	Permissions *session.PermissionsConfig `json:"permissions"`
 }
 
 // ResumeSessionRequest represents a request to resume a session
 type ResumeSessionRequest struct {
 	Confirmation string `json:"confirmation"`
+	Reason       string `json:"reason,omitempty"` // e.g reason for tool call rejection
 }
 
 // DesktopTokenResponse represents the response from getting a desktop token
@@ -155,19 +154,19 @@ type DesktopTokenResponse struct {
 	Token string `json:"token"`
 }
 
-// ResumeStartOauthRequest represents the user approval to start the OAuth flow
-type ResumeStartOauthRequest struct {
-	Confirmation bool `json:"confirmation"`
-}
-
-// ResumeCodeReceivedOauthRequest represents the response from getting the OAuth URL with code and state
-type ResumeCodeReceivedOauthRequest struct {
-	Code  string `json:"code"`
-	State string `json:"state"`
-}
-
 // ResumeElicitationRequest represents a request to resume with an elicitation response
 type ResumeElicitationRequest struct {
 	Action  string         `json:"action"`  // "accept", "decline", or "cancel"
 	Content map[string]any `json:"content"` // The submitted form data (only present when action is "accept")
+}
+
+// UpdateSessionTitleRequest represents a request to update a session's title
+type UpdateSessionTitleRequest struct {
+	Title string `json:"title"`
+}
+
+// UpdateSessionTitleResponse represents the response from updating a session's title
+type UpdateSessionTitleResponse struct {
+	ID    string `json:"id"`
+	Title string `json:"title"`
 }

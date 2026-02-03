@@ -2,67 +2,162 @@ package builtin
 
 import (
 	"bytes"
+	"cmp"
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/docker/cagent/pkg/concurrent"
+	"github.com/docker/cagent/pkg/config"
+	"github.com/docker/cagent/pkg/config/latest"
 	"github.com/docker/cagent/pkg/tools"
 )
 
-const ToolNameShell = "shell"
+const (
+	ToolNameShell              = "shell"
+	ToolNameRunShellBackground = "run_background_job"
+	ToolNameListBackgroundJobs = "list_background_jobs"
+	ToolNameViewBackgroundJob  = "view_background_job"
+	ToolNameStopBackgroundJob  = "stop_background_job"
+)
 
+// ShellTool provides shell command execution capabilities.
 type ShellTool struct {
-	tools.ElicitationTool
 	handler *shellHandler
 }
 
-// Make sure Shell Tool implements the ToolSet Interface
-var _ tools.ToolSet = (*ShellTool)(nil)
+// Verify interface compliance
+var (
+	_ tools.ToolSet      = (*ShellTool)(nil)
+	_ tools.Startable    = (*ShellTool)(nil)
+	_ tools.Instructable = (*ShellTool)(nil)
+)
 
 type shellHandler struct {
 	shell           string
 	shellArgsPrefix []string
 	env             []string
 	timeout         time.Duration
+	workingDir      string
+	jobs            *concurrent.Map[string, *backgroundJob]
+	jobCounter      atomic.Int64
+	sandbox         *sandboxRunner
+}
+
+// Job status constants
+const (
+	statusRunning int32 = iota
+	statusCompleted
+	statusStopped
+	statusFailed
+)
+
+// backgroundJob tracks a background shell command
+type backgroundJob struct {
+	id           string
+	cmd          string
+	cwd          string
+	process      *os.Process
+	processGroup *processGroup
+	outputMu     sync.RWMutex
+	output       *bytes.Buffer
+	startTime    time.Time
+	status       atomic.Int32
+	exitCode     int
+	err          error
+}
+
+// limitedWriter wraps a buffer and stops writing after maxSize bytes
+type limitedWriter struct {
+	mu      sync.Mutex
+	buf     *bytes.Buffer
+	written int64
+	maxSize int64
+}
+
+func (lw *limitedWriter) Write(p []byte) (n int, err error) {
+	lw.mu.Lock()
+	defer lw.mu.Unlock()
+
+	if lw.written >= lw.maxSize {
+		return len(p), nil // Discard but report success
+	}
+
+	remaining := lw.maxSize - lw.written
+	toWrite := min(int64(len(p)), remaining)
+
+	n, err = lw.buf.Write(p[:toWrite])
+	lw.written += int64(n)
+
+	if err == nil && int64(n) < int64(len(p)) {
+		return len(p), nil // Report full write even if truncated
+	}
+	return n, err
 }
 
 type RunShellArgs struct {
 	Cmd     string `json:"cmd" jsonschema:"The shell command to execute"`
-	Cwd     string `json:"cwd" jsonschema:"The working directory to execute the command in"`
+	Cwd     string `json:"cwd,omitempty" jsonschema:"The working directory to execute the command in (default: \".\")"`
 	Timeout int    `json:"timeout,omitempty" jsonschema:"Command execution timeout in seconds (default: 30)"`
 }
 
-func (h *shellHandler) RunShell(ctx context.Context, toolCall tools.ToolCall) (*tools.ToolCallResult, error) {
-	var params RunShellArgs
-	if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &params); err != nil {
-		return nil, fmt.Errorf("invalid arguments: %w", err)
-	}
+type RunShellBackgroundArgs struct {
+	Cmd string `json:"cmd" jsonschema:"The shell command to execute in the background"`
+	Cwd string `json:"cwd,omitempty" jsonschema:"The working directory to execute the command in (default: \".\")"`
+}
 
-	// Determine effective timeout
-	effectiveTimeout := h.timeout
+type ViewBackgroundJobArgs struct {
+	JobID string `json:"job_id" jsonschema:"The ID of the background job to view"`
+}
+
+type StopBackgroundJobArgs struct {
+	JobID string `json:"job_id" jsonschema:"The ID of the background job to stop"`
+}
+
+// statusStrings maps job status constants to their string representations
+var statusStrings = map[int32]string{
+	statusRunning:   "running",
+	statusCompleted: "completed",
+	statusStopped:   "stopped",
+	statusFailed:    "failed",
+}
+
+func statusToString(status int32) string {
+	if s, ok := statusStrings[status]; ok {
+		return s
+	}
+	return "unknown"
+}
+
+func (h *shellHandler) RunShell(ctx context.Context, params RunShellArgs) (*tools.ToolCallResult, error) {
+	timeout := h.timeout
 	if params.Timeout > 0 {
-		effectiveTimeout = time.Duration(params.Timeout) * time.Second
+		timeout = time.Duration(params.Timeout) * time.Second
 	}
 
-	// Create timeout context
-	timeoutCtx, cancel := context.WithTimeout(ctx, effectiveTimeout)
+	timeoutCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cmd := exec.Command(h.shell, append(h.shellArgsPrefix, params.Cmd)...)
-	cmd.Env = h.env
-	if params.Cwd != "" {
-		cmd.Dir = params.Cwd
-	} else {
-		if wd, err := os.Getwd(); err == nil {
-			cmd.Dir = wd
-		}
+	cwd := h.resolveWorkDir(params.Cwd)
+
+	// Delegate to sandbox runner if configured
+	if h.sandbox != nil {
+		return h.sandbox.runCommand(timeoutCtx, ctx, params.Cmd, cwd, timeout), nil
 	}
 
+	return h.runNativeCommand(timeoutCtx, ctx, params.Cmd, cwd, timeout), nil
+}
+
+func (h *shellHandler) runNativeCommand(timeoutCtx, ctx context.Context, command, cwd string, timeout time.Duration) *tools.ToolCallResult {
+	cmd := exec.Command(h.shell, append(h.shellArgsPrefix, command)...)
+	cmd.Env = h.env
+	cmd.Dir = cwd
 	cmd.SysProcAttr = platformSpecificSysProcAttr()
 
 	var outBuf bytes.Buffer
@@ -70,16 +165,12 @@ func (h *shellHandler) RunShell(ctx context.Context, toolCall tools.ToolCall) (*
 	cmd.Stderr = &outBuf
 
 	if err := cmd.Start(); err != nil {
-		return &tools.ToolCallResult{
-			Output: fmt.Sprintf("Error starting command: %s", err),
-		}, nil
+		return tools.ResultError(fmt.Sprintf("Error starting command: %s", err))
 	}
 
 	pg, err := createProcessGroup(cmd.Process)
 	if err != nil {
-		return &tools.ToolCallResult{
-			Output: fmt.Sprintf("Error creating process group: %s", err),
-		}, nil
+		return tools.ResultError(fmt.Sprintf("Error creating process group: %s", err))
 	}
 
 	done := make(chan error, 1)
@@ -87,170 +178,301 @@ func (h *shellHandler) RunShell(ctx context.Context, toolCall tools.ToolCall) (*
 		done <- cmd.Wait()
 	}()
 
+	var cmdErr error
 	select {
 	case <-timeoutCtx.Done():
-		if cmd.Process != nil {
-			_ = kill(cmd.Process, pg)
-		}
-		output := outBuf.String()
-		// Check if parent context was cancelled or if it was a timeout
-		if ctx.Err() != nil {
-			// Parent context was cancelled
-			return &tools.ToolCallResult{
-				Output: "Command cancelled",
-			}, nil
-		}
-		// Timeout occurred
-		return &tools.ToolCallResult{
-			Output: fmt.Sprintf("Command timed out after %v\nOutput: %s", effectiveTimeout, output),
-		}, nil
-	case err := <-done:
-		output := outBuf.String()
+		_ = kill(cmd.Process, pg)
+	case cmdErr = <-done:
+	}
 
-		if err != nil {
-			return &tools.ToolCallResult{
-				Output: fmt.Sprintf("Error executing command: %s\nOutput: %s", err, output),
-			}, nil
-		}
+	output := formatCommandOutput(timeoutCtx, ctx, cmdErr, outBuf.String(), timeout)
+	return tools.ResultSuccess(limitOutput(output))
+}
 
-		if strings.TrimSpace(output) == "" {
-			return &tools.ToolCallResult{
-				Output: "<no output>",
-			}, nil
-		}
+func (h *shellHandler) RunShellBackground(_ context.Context, params RunShellBackgroundArgs) (*tools.ToolCallResult, error) {
+	counter := h.jobCounter.Add(1)
+	jobID := fmt.Sprintf("job_%d_%d", time.Now().Unix(), counter)
 
-		return &tools.ToolCallResult{
-			Output: fmt.Sprintf("Output: %s", output),
-		}, nil
+	cmd := exec.Command(h.shell, append(h.shellArgsPrefix, params.Cmd)...)
+	cmd.Env = h.env
+	cmd.Dir = h.resolveWorkDir(params.Cwd)
+	cmd.SysProcAttr = platformSpecificSysProcAttr()
+
+	outputBuf := &bytes.Buffer{}
+	limitedWriter := &limitedWriter{buf: outputBuf, maxSize: 10 * 1024 * 1024}
+	cmd.Stdout = limitedWriter
+	cmd.Stderr = limitedWriter
+
+	if err := cmd.Start(); err != nil {
+		return tools.ResultError(fmt.Sprintf("Error starting background command: %s", err)), nil
+	}
+
+	pg, err := createProcessGroup(cmd.Process)
+	if err != nil {
+		_ = kill(cmd.Process, pg)
+		return tools.ResultError(fmt.Sprintf("Error creating process group: %s", err)), nil
+	}
+
+	job := &backgroundJob{
+		id:           jobID,
+		cmd:          params.Cmd,
+		cwd:          params.Cwd,
+		process:      cmd.Process,
+		processGroup: pg,
+		output:       outputBuf,
+		startTime:    time.Now(),
+	}
+	job.status.Store(statusRunning)
+	h.jobs.Store(jobID, job)
+
+	go h.monitorJob(job, cmd)
+
+	return tools.ResultSuccess(fmt.Sprintf("Background job started with ID: %s\nCommand: %s\nWorking directory: %s",
+		jobID, params.Cmd, params.Cwd)), nil
+}
+
+func (h *shellHandler) monitorJob(job *backgroundJob, cmd *exec.Cmd) {
+	err := cmd.Wait()
+
+	job.outputMu.Lock()
+	defer job.outputMu.Unlock()
+
+	if job.status.Load() == statusStopped {
+		return
+	}
+
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			job.exitCode = exitErr.ExitCode()
+		} else {
+			job.exitCode = -1
+		}
+		job.status.Store(statusFailed)
+		job.err = err
+	} else {
+		job.exitCode = 0
+		job.status.Store(statusCompleted)
 	}
 }
 
-func NewShellTool(env []string) *ShellTool {
-	var shell string
-	var argsPrefix []string
+func (h *shellHandler) ListBackgroundJobs(_ context.Context, _ map[string]any) (*tools.ToolCallResult, error) {
+	var output strings.Builder
+	output.WriteString("Background Jobs:\n\n")
+
+	jobCount := 0
+	h.jobs.Range(func(jobID string, job *backgroundJob) bool {
+		jobCount++
+		status := job.status.Load()
+		elapsed := time.Since(job.startTime).Round(time.Second)
+
+		fmt.Fprintf(&output, "ID: %s\n", jobID)
+		fmt.Fprintf(&output, "  Command: %s\n", job.cmd)
+		fmt.Fprintf(&output, "  Status: %s\n", statusToString(status))
+		fmt.Fprintf(&output, "  Runtime: %s\n", elapsed)
+		if status != statusRunning {
+			job.outputMu.RLock()
+			fmt.Fprintf(&output, "  Exit Code: %d\n", job.exitCode)
+			job.outputMu.RUnlock()
+		}
+		output.WriteString("\n")
+		return true
+	})
+
+	if jobCount == 0 {
+		output.WriteString("No background jobs found.\n")
+	}
+
+	return tools.ResultSuccess(output.String()), nil
+}
+
+func (h *shellHandler) ViewBackgroundJob(_ context.Context, params ViewBackgroundJobArgs) (*tools.ToolCallResult, error) {
+	job, exists := h.jobs.Load(params.JobID)
+	if !exists {
+		return tools.ResultError(fmt.Sprintf("Job not found: %s", params.JobID)), nil
+	}
+
+	status := job.status.Load()
+
+	job.outputMu.RLock()
+	output := job.output.String()
+	exitCode := job.exitCode
+	job.outputMu.RUnlock()
+
+	var result strings.Builder
+	fmt.Fprintf(&result, "Job ID: %s\n", job.id)
+	fmt.Fprintf(&result, "Command: %s\n", job.cmd)
+	fmt.Fprintf(&result, "Status: %s\n", statusToString(status))
+	fmt.Fprintf(&result, "Runtime: %s\n", time.Since(job.startTime).Round(time.Second))
+	if status != statusRunning {
+		fmt.Fprintf(&result, "Exit Code: %d\n", exitCode)
+	}
+	result.WriteString("\n--- Output ---\n")
+	if output == "" {
+		result.WriteString("<no output>\n")
+	} else {
+		result.WriteString(output)
+		if len(output) >= 10*1024*1024 {
+			result.WriteString("\n\n[Output truncated at 10MB limit]")
+		}
+	}
+
+	return tools.ResultSuccess(result.String()), nil
+}
+
+func (h *shellHandler) StopBackgroundJob(_ context.Context, params StopBackgroundJobArgs) (*tools.ToolCallResult, error) {
+	job, exists := h.jobs.Load(params.JobID)
+	if !exists {
+		return tools.ResultError(fmt.Sprintf("Job not found: %s", params.JobID)), nil
+	}
+
+	if !job.status.CompareAndSwap(statusRunning, statusStopped) {
+		currentStatus := job.status.Load()
+		return tools.ResultError(fmt.Sprintf("Job %s is not running (current status: %s)", params.JobID, statusToString(currentStatus))), nil
+	}
+
+	if err := kill(job.process, job.processGroup); err != nil {
+		return tools.ResultError(fmt.Sprintf("Job %s marked as stopped, but error killing process: %s", params.JobID, err)), nil
+	}
+
+	return tools.ResultSuccess(fmt.Sprintf("Job %s stopped successfully", params.JobID)), nil
+}
+
+// NewShellTool creates a new shell tool with optional sandbox configuration.
+func NewShellTool(env []string, runConfig *config.RuntimeConfig, sandboxConfig *latest.SandboxConfig) *ShellTool {
+	shell, argsPrefix := detectShell(sandboxConfig != nil)
+
+	handler := &shellHandler{
+		shell:           shell,
+		shellArgsPrefix: argsPrefix,
+		env:             env,
+		timeout:         30 * time.Second,
+		jobs:            concurrent.NewMap[string, *backgroundJob](),
+		workingDir:      runConfig.WorkingDir,
+	}
+
+	if sandboxConfig != nil {
+		handler.sandbox = newSandboxRunner(sandboxConfig, runConfig.WorkingDir, env)
+	}
+
+	return &ShellTool{handler: handler}
+}
+
+// detectShell returns the appropriate shell and arguments based on the platform.
+func detectShell(sandboxMode bool) (shell string, argsPrefix []string) {
+	if sandboxMode {
+		return "/bin/sh", []string{"-c"}
+	}
 
 	if runtime.GOOS == "windows" {
-		// Prefer PowerShell (pwsh or Windows PowerShell) when available, otherwise fall back to cmd.exe
-		if path, err := exec.LookPath("pwsh.exe"); err == nil {
-			shell = path
-			argsPrefix = []string{"-NoProfile", "-NonInteractive", "-Command"}
-		} else if path, err := exec.LookPath("powershell.exe"); err == nil {
-			shell = path
-			argsPrefix = []string{"-NoProfile", "-NonInteractive", "-Command"}
-		} else {
-			// Use ComSpec if available, otherwise default to cmd.exe
-			if comspec := os.Getenv("ComSpec"); comspec != "" {
-				shell = comspec
-			} else {
-				shell = "cmd.exe"
-			}
-			argsPrefix = []string{"/C"}
-		}
-	} else {
-		// Unix-like: use SHELL or default to /bin/sh
-		shell = os.Getenv("SHELL")
-		if shell == "" {
-			shell = "/bin/sh"
-		}
-		argsPrefix = []string{"-c"}
+		return detectWindowsShell()
 	}
 
-	return &ShellTool{
-		handler: &shellHandler{
-			shell:           shell,
-			shellArgsPrefix: argsPrefix,
-			env:             env,
-			timeout:         30 * time.Second,
-		},
+	return cmp.Or(os.Getenv("SHELL"), "/bin/sh"), []string{"-c"}
+}
+
+func detectWindowsShell() (shell string, argsPrefix []string) {
+	powershellArgs := []string{"-NoProfile", "-NonInteractive", "-Command"}
+	for _, ps := range []string{"pwsh.exe", "powershell.exe"} {
+		if path, err := exec.LookPath(ps); err == nil {
+			return path, powershellArgs
+		}
 	}
+	return cmp.Or(os.Getenv("ComSpec"), "cmd.exe"), []string{"/C"}
+}
+
+// resolveWorkDir returns the effective working directory.
+func (h *shellHandler) resolveWorkDir(cwd string) string {
+	if cwd == "" || cwd == "." {
+		return h.workingDir
+	}
+	return cwd
+}
+
+// formatCommandOutput formats command output handling timeout, cancellation, and errors.
+func formatCommandOutput(timeoutCtx, ctx context.Context, err error, rawOutput string, timeout time.Duration) string {
+	var output string
+	if timeoutCtx.Err() != nil {
+		if ctx.Err() != nil {
+			output = "Command cancelled"
+		} else {
+			output = fmt.Sprintf("Command timed out after %v\nOutput: %s", timeout, rawOutput)
+		}
+	} else {
+		output = rawOutput
+		if err != nil {
+			output = fmt.Sprintf("Error executing command: %s\nOutput: %s", err, output)
+		}
+	}
+	return cmp.Or(strings.TrimSpace(output), "<no output>")
 }
 
 func (t *ShellTool) Instructions() string {
-	return `# Shell Tool Usage Guide
+	if t.handler.sandbox != nil {
+		return t.buildSandboxInstructions()
+	}
+	return nativeInstructions
+}
 
-Execute shell commands in the user's environment with full control over working directories and command parameters.
-
-## Core Concepts
-
-**Execution Context**: Commands run in the user's default shell with access to all environment variables and the current workspace.
-On Windows, PowerShell (pwsh/powershell) is used when available; otherwise, cmd.exe is used.
-On Unix-like systems, ${SHELL} is used or /bin/sh as fallback.
-
-**Working Directory Management**:
-- Default execution location: workspace root
-- Override with "cwd" parameter for targeted command execution
-- Supports both absolute and relative paths
-
-**Command Isolation**: Each tool call creates a fresh shell session - no state persists between executions.
-
-**Timeout Protection**: Commands have a default 30-second timeout to prevent hanging. For longer operations, specify a custom timeout.
-
-## Parameter Reference
-
-| Parameter | Type   | Required | Description |
-|-----------|--------|----------|-------------|
-| cmd       | string | Yes      | Shell command to execute |
-| cwd       | string | Yes      | Working directory (use "." for current) |
-| timeout   | int    | No       | Timeout in seconds (default: 30) |
-
-## Best Practices
-
-### ✅ DO
-- Leverage the "cwd" parameter for directory-specific commands
-- Quote arguments containing spaces or special characters
-- Use pipes and redirections
-- Write advanced scripts with heredocs, that replace a lot of simple commands or tool calls
-- This tool is great at reading and writing multiple files at once
-- Avoid writing shell scripts to the disk. Instead, use heredocs to pipe the script to the SHELL
-- Use the timeout parameter for long-running operations (e.g., builds, tests)
-
-## Usage Examples
-
-**Basic command execution:**
-{ "cmd": "ls -la", "cwd": "." }
-
-**Long-running command with custom timeout:**
-{ "cmd": "npm run build", "cwd": ".", "timeout": 120 }
-
-**Language-specific operations:**
-{ "cmd": "go test ./...", "cwd": ".", "timeout": 180 }
-{ "cmd": "npm install", "cwd": "frontend" }
-{ "cmd": "python -m pytest tests/", "cwd": "backend", "timeout": 90 }
-
-**File operations:**
-{ "cmd": "find . -name '*.go' -type f", "cwd": "." }
-{ "cmd": "grep -r 'TODO' src/", "cwd": "." }
-
-**Process management:**
-{ "cmd": "ps aux | grep node", "cwd": "." }
-{ "cmd": "docker ps --format 'table {{.Names}}\t{{.Status}}'", "cwd": "." }
-
-**Complex pipelines:**
-{ "cmd": "cat package.json | jq '.dependencies'", "cwd": "frontend" }
-
-**Bash scripts:**
-{ "cmd": "cat << 'EOF' | ${SHELL}
-echo Hello
-EOF" }
-
-## Error Handling
-
-Commands that exit with non-zero status codes will return error information along with any output produced before failure.
-Commands that exceed their timeout will be terminated automatically.`
+// buildSandboxInstructions returns the native instructions with a note about Linux sandboxing.
+func (t *ShellTool) buildSandboxInstructions() string {
+	return "**Note:** For sandboxing reasons, all shell commands run inside a Linux container.\n\n" + nativeInstructions
 }
 
 func (t *ShellTool) Tools(context.Context) ([]tools.Tool, error) {
+	shellDesc := `Executes the given shell command in the user's default shell.`
+	if t.handler.sandbox != nil {
+		shellDesc = `Executes the given shell command inside a sandboxed Linux container (Alpine Linux with /bin/sh). Only mounted paths are accessible. Installed tools persist across calls.`
+	}
+
 	return []tools.Tool{
 		{
-			Name:         ToolNameShell,
-			Category:     "shell",
-			Description:  `Executes the given shell command in the user's default shell.`,
-			Parameters:   tools.MustSchemaFor[RunShellArgs](),
-			OutputSchema: tools.MustSchemaFor[string](),
-			Handler:      t.handler.RunShell,
-			Annotations: tools.ToolAnnotations{
-				Title: "Run Shell Command",
-			},
+			Name:                    ToolNameShell,
+			Category:                "shell",
+			Description:             shellDesc,
+			Parameters:              tools.MustSchemaFor[RunShellArgs](),
+			OutputSchema:            tools.MustSchemaFor[string](),
+			Handler:                 tools.NewHandler(t.handler.RunShell),
+			Annotations:             tools.ToolAnnotations{Title: "Shell"},
+			AddDescriptionParameter: true,
+		},
+		{
+			Name:                    ToolNameRunShellBackground,
+			Category:                "shell",
+			Description:             `Starts a shell command in the background and returns immediately with a job ID. Use this for long-running processes like servers, watches, or any command that should run while other tasks are performed.`,
+			Parameters:              tools.MustSchemaFor[RunShellBackgroundArgs](),
+			OutputSchema:            tools.MustSchemaFor[string](),
+			Handler:                 tools.NewHandler(t.handler.RunShellBackground),
+			Annotations:             tools.ToolAnnotations{Title: "Background Job"},
+			AddDescriptionParameter: true,
+		},
+		{
+			Name:                    ToolNameListBackgroundJobs,
+			Category:                "shell",
+			Description:             `Lists all background jobs with their status, runtime, and other information.`,
+			OutputSchema:            tools.MustSchemaFor[string](),
+			Handler:                 tools.NewHandler(t.handler.ListBackgroundJobs),
+			Annotations:             tools.ToolAnnotations{Title: "List Background Jobs", ReadOnlyHint: true},
+			AddDescriptionParameter: true,
+		},
+		{
+			Name:                    ToolNameViewBackgroundJob,
+			Category:                "shell",
+			Description:             `Views the output and status of a specific background job by job ID.`,
+			Parameters:              tools.MustSchemaFor[ViewBackgroundJobArgs](),
+			OutputSchema:            tools.MustSchemaFor[string](),
+			Handler:                 tools.NewHandler(t.handler.ViewBackgroundJob),
+			Annotations:             tools.ToolAnnotations{Title: "View Background Job Output", ReadOnlyHint: true},
+			AddDescriptionParameter: true,
+		},
+		{
+			Name:                    ToolNameStopBackgroundJob,
+			Category:                "shell",
+			Description:             `Stops a running background job by job ID. The process and all its child processes will be terminated.`,
+			Parameters:              tools.MustSchemaFor[StopBackgroundJobArgs](),
+			OutputSchema:            tools.MustSchemaFor[string](),
+			Handler:                 tools.NewHandler(t.handler.StopBackgroundJob),
+			Annotations:             tools.ToolAnnotations{Title: "Stop Background Job"},
+			AddDescriptionParameter: true,
 		},
 	}, nil
 }
@@ -260,5 +482,18 @@ func (t *ShellTool) Start(context.Context) error {
 }
 
 func (t *ShellTool) Stop(context.Context) error {
+	// Terminate all running background jobs
+	t.handler.jobs.Range(func(_ string, job *backgroundJob) bool {
+		if job.status.CompareAndSwap(statusRunning, statusStopped) {
+			_ = kill(job.process, job.processGroup)
+		}
+		return true
+	})
+
+	// Stop sandbox container if running
+	if t.handler.sandbox != nil {
+		t.handler.sandbox.stop()
+	}
+
 	return nil
 }

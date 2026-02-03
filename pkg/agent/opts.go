@@ -1,8 +1,8 @@
 package agent
 
 import (
-	"sync/atomic"
-
+	"github.com/docker/cagent/pkg/config/latest"
+	"github.com/docker/cagent/pkg/config/types"
 	"github.com/docker/cagent/pkg/model/provider"
 	"github.com/docker/cagent/pkg/tools"
 )
@@ -16,11 +16,9 @@ func WithInstruction(instruction string) Opt {
 }
 
 func WithToolSets(toolSet ...tools.ToolSet) Opt {
-	var startableToolSet []*StartableToolSet
+	var startableToolSet []*tools.StartableToolSet
 	for _, ts := range toolSet {
-		startableToolSet = append(startableToolSet, &StartableToolSet{
-			ToolSet: ts,
-		})
+		startableToolSet = append(startableToolSet, tools.NewStartable(ts))
 	}
 
 	return func(a *Agent) {
@@ -67,6 +65,12 @@ func WithSubAgents(subAgents ...*Agent) Opt {
 	}
 }
 
+func WithHandoffs(handoffs ...*Agent) Opt {
+	return func(a *Agent) {
+		a.handoffs = handoffs
+	}
+}
+
 func WithAddDate(addDate bool) Opt {
 	return func(a *Agent) {
 		a.addDate = addDate
@@ -76,6 +80,12 @@ func WithAddDate(addDate bool) Opt {
 func WithAddEnvironmentInfo(addEnvironmentInfo bool) Opt {
 	return func(a *Agent) {
 		a.addEnvironmentInfo = addEnvironmentInfo
+	}
+}
+
+func WithAddDescriptionParameter(addDescriptionParameter bool) Opt {
+	return func(a *Agent) {
+		a.addDescriptionParameter = addDescriptionParameter
 	}
 }
 
@@ -97,7 +107,7 @@ func WithNumHistoryItems(numHistoryItems int) Opt {
 	}
 }
 
-func WithCommands(commands map[string]string) Opt {
+func WithCommands(commands types.Commands) Opt {
 	return func(a *Agent) {
 		a.commands = commands
 	}
@@ -111,7 +121,22 @@ func WithLoadTimeWarnings(warnings []string) Opt {
 	}
 }
 
-type StartableToolSet struct {
-	tools.ToolSet
-	started atomic.Bool
+func WithSkillsEnabled(enabled bool) Opt {
+	return func(a *Agent) {
+		a.skillsEnabled = enabled
+	}
+}
+
+func WithHooks(hooks *latest.HooksConfig) Opt {
+	return func(a *Agent) {
+		a.hooks = hooks
+	}
+}
+
+// WithThinkingConfigured sets whether thinking_budget was explicitly configured in the agent's YAML.
+// When true, the session will initialize with thinking enabled.
+func WithThinkingConfigured(configured bool) Opt {
+	return func(a *Agent) {
+		a.thinkingConfigured = configured
+	}
 }

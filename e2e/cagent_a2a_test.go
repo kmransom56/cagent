@@ -15,7 +15,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	a2aserver "github.com/docker/cagent/pkg/a2a"
-	"github.com/docker/cagent/pkg/cli"
 	"github.com/docker/cagent/pkg/config"
 )
 
@@ -42,10 +41,10 @@ type Part struct {
 func TestA2AServer_AgentCard(t *testing.T) {
 	t.Parallel()
 
-	_, runtimeConfig := startRecordingAIProxy(t)
-	agentCard := startA2AServer(t, "testdata/basic.yaml", runtimeConfig)
+	_, runConfig := startRecordingAIProxy(t)
+	agentCard := startA2AServer(t, "testdata/basic.yaml", runConfig)
 
-	assert.Equal(t, "root", agentCard.Name)
+	assert.Equal(t, "basic", agentCard.Name)
 	assert.NotEmpty(t, agentCard.Description)
 	assert.Equal(t, a2a.TransportProtocolJSONRPC, agentCard.PreferredTransport)
 	assert.Contains(t, agentCard.URL, "/invoke")
@@ -56,8 +55,8 @@ func TestA2AServer_AgentCard(t *testing.T) {
 func TestA2AServer_Invoke(t *testing.T) {
 	t.Parallel()
 
-	_, runtimeConfig := startRecordingAIProxy(t)
-	agentCard := startA2AServer(t, "testdata/basic.yaml", runtimeConfig)
+	_, runConfig := startRecordingAIProxy(t)
+	agentCard := startA2AServer(t, "testdata/basic.yaml", runConfig)
 
 	requestID := "test-request-1"
 	jsonRPCRequest := map[string]any{
@@ -112,8 +111,8 @@ func TestA2AServer_Invoke(t *testing.T) {
 func TestA2AServer_MultipleRequests(t *testing.T) {
 	t.Parallel()
 
-	_, runtimeConfig := startRecordingAIProxy(t)
-	agentCard := startA2AServer(t, "testdata/basic.yaml", runtimeConfig)
+	_, runConfig := startRecordingAIProxy(t)
+	agentCard := startA2AServer(t, "testdata/basic.yaml", runConfig)
 
 	messages := []string{
 		"Say 'hello' in one word.",
@@ -170,8 +169,8 @@ func TestA2AServer_MultipleRequests(t *testing.T) {
 func TestA2AServer_MultiAgent(t *testing.T) {
 	t.Parallel()
 
-	_, runtimeConfig := startRecordingAIProxy(t)
-	agentCard := startA2AServer(t, "testdata/multi.yaml", runtimeConfig)
+	_, runConfig := startRecordingAIProxy(t)
+	agentCard := startA2AServer(t, "testdata/multi.yaml", runConfig)
 
 	requestID := "test-multi-1"
 	jsonRPCRequest := map[string]any{
@@ -213,12 +212,17 @@ func TestA2AServer_MultiAgent(t *testing.T) {
 
 	assert.Equal(t, requestID, jsonRPCResponse.ID)
 	assert.Nil(t, jsonRPCResponse.Error)
-	assert.NotNil(t, jsonRPCResponse.Result)
+	require.NotNil(t, jsonRPCResponse.Result)
+	require.Len(t, jsonRPCResponse.Result.Artifacts, 1)
+	require.NotEmpty(t, jsonRPCResponse.Result.Artifacts[0].Parts)
 
-	t.Logf("Multi-agent response: %s", string(responseBody))
+	// The last part contains the complete response text
+	lastPart := jsonRPCResponse.Result.Artifacts[0].Parts[len(jsonRPCResponse.Result.Artifacts[0].Parts)-1]
+	assert.Equal(t, "text", lastPart.Kind)
+	assert.Contains(t, lastPart.Text, "Hello")
 }
 
-func startA2AServer(t *testing.T, agentFile string, runConfig config.RuntimeConfig) a2a.AgentCard {
+func startA2AServer(t *testing.T, agentFile string, runConfig *config.RuntimeConfig) a2a.AgentCard {
 	t.Helper()
 
 	var lc net.ListenConfig
@@ -227,8 +231,7 @@ func startA2AServer(t *testing.T, agentFile string, runConfig config.RuntimeConf
 	require.NoError(t, err)
 
 	go func() {
-		out := cli.NewPrinter(io.Discard)
-		_ = a2aserver.Start(t.Context(), out, agentFile, "root", runConfig, ln)
+		_ = a2aserver.Run(t.Context(), agentFile, "root", runConfig, ln)
 	}()
 
 	port := ln.Addr().(*net.TCPAddr).Port

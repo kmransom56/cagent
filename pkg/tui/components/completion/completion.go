@@ -1,7 +1,8 @@
 package completion
 
 import (
-	"sort"
+	"cmp"
+	"slices"
 	"strings"
 
 	"charm.land/bubbles/v2/key"
@@ -17,15 +18,27 @@ import (
 
 const maxItems = 10
 
+// MatchMode defines how completion items are filtered
+type MatchMode int
+
+const (
+	// MatchFuzzy uses fuzzy matching (matches anywhere in label)
+	MatchFuzzy MatchMode = iota
+	// MatchPrefix requires the query to match the start of the label
+	MatchPrefix
+)
+
 type Item struct {
 	Label       string
 	Description string
 	Value       string
 	Execute     func() tea.Cmd
+	Pinned      bool // Pinned items always appear at the top, in original order
 }
 
 type OpenMsg struct {
-	Items []Item
+	Items     []Item
+	MatchMode MatchMode
 }
 
 type OpenedMsg struct{}
@@ -41,6 +54,11 @@ type QueryMsg struct {
 type SelectedMsg struct {
 	Value   string
 	Execute func() tea.Cmd
+}
+
+// SelectionChangedMsg is sent when the selected item changes (for preview in editor)
+type SelectionChangedMsg struct {
+	Value string
 }
 
 type matchResult struct {
@@ -83,6 +101,9 @@ type Manager interface {
 
 	GetLayers() []*lipgloss.Layer
 	Open() bool
+	// SetEditorBottom sets the height from the bottom of the screen where the editor ends.
+	// This is used to position the completion popup above the editor.
+	SetEditorBottom(height int)
 }
 
 // manager represents an item completion component that manages completion state and UI
@@ -90,12 +111,14 @@ type manager struct {
 	keyMap        completionKeyMap
 	width         int
 	height        int
+	editorBottom  int // height from screen bottom where editor ends (for popup positioning)
 	items         []Item
 	filteredItems []Item
 	query         string
 	selected      int
 	scrollOffset  int
 	visible       bool
+	matchMode     MatchMode
 }
 
 // New creates a new  completion component
@@ -123,15 +146,25 @@ func (c *manager) Update(msg tea.Msg) (layout.Model, tea.Cmd) {
 	case QueryMsg:
 		c.query = msg.Query
 		c.filterItems(c.query)
-		return c, nil
+		// Keep the popup visible even with no results - user can backspace to broaden the query
+		cmd := c.notifySelectionChanged()
+		return c, cmd
 
 	case OpenMsg:
-		c.visible = true
 		c.items = msg.Items
+		c.matchMode = msg.MatchMode
 		c.selected = 0
 		c.scrollOffset = 0
+		c.query = "" // Reset query when opening new completion
 		c.filterItems(c.query)
-		return c, core.CmdHandler(OpenedMsg{})
+		c.visible = len(c.filteredItems) > 0
+		if !c.visible {
+			return c, nil
+		}
+		return c, tea.Batch(
+			core.CmdHandler(OpenedMsg{}),
+			c.notifySelectionChanged(),
+		)
 
 	case CloseMsg:
 		c.visible = false
@@ -146,6 +179,8 @@ func (c *manager) Update(msg tea.Msg) (layout.Model, tea.Cmd) {
 			if c.selected < c.scrollOffset {
 				c.scrollOffset = c.selected
 			}
+			cmd := c.notifySelectionChanged()
+			return c, cmd
 
 		case key.Matches(msg, c.keyMap.Down):
 			if c.selected < len(c.filteredItems)-1 {
@@ -154,10 +189,22 @@ func (c *manager) Update(msg tea.Msg) (layout.Model, tea.Cmd) {
 			if c.selected >= c.scrollOffset+10 {
 				c.scrollOffset = c.selected - 9
 			}
+			cmd := c.notifySelectionChanged()
+			return c, cmd
 
 		case key.Matches(msg, c.keyMap.Enter):
 			c.visible = false
-			return c, core.CmdHandler(SelectedMsg{Value: c.filteredItems[c.selected].Value, Execute: c.filteredItems[c.selected].Execute})
+			if len(c.filteredItems) == 0 || c.selected >= len(c.filteredItems) {
+				return c, core.CmdHandler(ClosedMsg{})
+			}
+			selectedItem := c.filteredItems[c.selected]
+			return c, tea.Sequence(
+				core.CmdHandler(SelectedMsg{
+					Value:   selectedItem.Value,
+					Execute: selectedItem.Execute,
+				}),
+				core.CmdHandler(ClosedMsg{}),
+			)
 		case key.Matches(msg, c.keyMap.Escape):
 			c.visible = false
 			return c, core.CmdHandler(ClosedMsg{})
@@ -173,6 +220,10 @@ func (c *manager) SetSize(width, height int) tea.Cmd {
 	return nil
 }
 
+func (c *manager) SetEditorBottom(height int) {
+	c.editorBottom = height
+}
+
 func (c *manager) View() string {
 	if !c.visible {
 		return ""
@@ -181,14 +232,14 @@ func (c *manager) View() string {
 	var lines []string
 
 	if len(c.filteredItems) == 0 {
-		lines = append(lines, styles.CompletionNoResultsStyle.Render("No results found"))
+		lines = append(lines, styles.CompletionNoResultsStyle.Render("No command found"))
 	} else {
 		visibleStart := c.scrollOffset
 		visibleEnd := min(c.scrollOffset+maxItems, len(c.filteredItems))
 
 		maxLabelLen := 0
 		for i := visibleStart; i < visibleEnd; i++ {
-			labelLen := len(c.filteredItems[i].Label)
+			labelLen := lipgloss.Width(c.filteredItems[i].Label)
 			if labelLen > maxLabelLen {
 				maxLabelLen = labelLen
 			}
@@ -198,18 +249,18 @@ func (c *manager) View() string {
 			item := c.filteredItems[i]
 			isSelected := i == c.selected
 
-			var itemStyle lipgloss.Style
+			itemStyle := styles.CompletionNormalStyle
+			descStyle := styles.CompletionDescStyle
 			if isSelected {
 				itemStyle = styles.CompletionSelectedStyle
-			} else {
-				itemStyle = styles.CompletionNormalStyle
+				descStyle = styles.CompletionSelectedDescStyle
 			}
 
 			// Pad label to maxLabelLen so descriptions align
-			paddedLabel := item.Label + strings.Repeat(" ", maxLabelLen+1-len(item.Label))
+			paddedLabel := item.Label + strings.Repeat(" ", maxLabelLen+1-lipgloss.Width(item.Label))
 			text := paddedLabel
 			if item.Description != "" {
-				text += " " + styles.CompletionDescStyle.Render(item.Description)
+				text += " " + descStyle.Render(item.Description)
 			}
 
 			lines = append(lines, itemStyle.Width(c.width-6).Render(text))
@@ -228,49 +279,99 @@ func (c *manager) GetLayers() []*lipgloss.Layer {
 	view := c.View()
 	viewHeight := lipgloss.Height(view)
 
-	editorHeight := 4
+	// Use actual editor height if set, otherwise fall back to reasonable default
+	editorHeight := cmp.Or(c.editorBottom, 4)
 	yPos := max(c.height-viewHeight-editorHeight-1, 0)
 
 	return []*lipgloss.Layer{
-		lipgloss.NewLayer(view).SetContent(view).X(1).Y(yPos),
+		lipgloss.NewLayer(view).SetContent(view).X(styles.AppPaddingLeft).Y(yPos),
 	}
+}
+
+// notifySelectionChanged sends a SelectionChangedMsg with the currently selected item's value
+func (c *manager) notifySelectionChanged() tea.Cmd {
+	if len(c.filteredItems) == 0 || c.selected >= len(c.filteredItems) {
+		return core.CmdHandler(SelectionChangedMsg{Value: ""})
+	}
+	return core.CmdHandler(SelectionChangedMsg{Value: c.filteredItems[c.selected].Value})
 }
 
 func (c *manager) filterItems(query string) {
 	if query == "" {
 		c.filteredItems = c.items
+		// Reset selection when clearing the query
+		if c.selected >= len(c.filteredItems) {
+			c.selected = max(0, len(c.filteredItems)-1)
+		}
 		return
 	}
 
-	pattern := []rune(strings.ToLower(query))
+	lowerQuery := strings.ToLower(query)
+	var pinnedItems []Item
 	var matches []matchResult
 
 	for _, item := range c.items {
-		chars := util.ToChars([]byte(item.Label))
-		result, _ := algo.FuzzyMatchV1(
-			false, // caseSensitive
-			false, // normalize
-			true,  // forward
-			&chars,
-			pattern,
-			true, // withPos
-			nil,  // slab
-		)
+		var matched bool
+		var score int
 
-		if result.Start >= 0 {
-			matches = append(matches, matchResult{
-				item:  item,
-				score: result.Score,
-			})
+		if c.matchMode == MatchPrefix {
+			// Prefix matching: label must start with query (case-insensitive)
+			if strings.HasPrefix(strings.ToLower(item.Label), lowerQuery) {
+				matched = true
+				score = 1000 - len(item.Label) // Shorter labels rank higher
+			}
+		} else {
+			// Fuzzy matching
+			pattern := []rune(lowerQuery)
+			chars := util.ToChars([]byte(item.Label))
+			result, _ := algo.FuzzyMatchV1(
+				false, // caseSensitive
+				false, // normalize
+				true,  // forward
+				&chars,
+				pattern,
+				true, // withPos
+				nil,  // slab
+			)
+			if result.Start >= 0 {
+				matched = true
+				score = result.Score
+			}
+		}
+
+		if matched {
+			if item.Pinned {
+				// Pinned items keep their original order at the top
+				pinnedItems = append(pinnedItems, item)
+			} else {
+				matches = append(matches, matchResult{
+					item:  item,
+					score: score,
+				})
+			}
 		}
 	}
 
-	sort.Slice(matches, func(i, j int) bool {
-		return matches[i].score > matches[j].score
+	slices.SortFunc(matches, func(a, b matchResult) int {
+		return cmp.Compare(b.score, a.score)
 	})
 
-	c.filteredItems = make([]Item, 0, len(matches))
+	// Build result: pinned items first, then sorted matches
+	c.filteredItems = make([]Item, 0, len(pinnedItems)+len(matches))
+	c.filteredItems = append(c.filteredItems, pinnedItems...)
 	for _, match := range matches {
 		c.filteredItems = append(c.filteredItems, match.item)
+	}
+
+	// Adjust selection if it's beyond the filtered list
+	if c.selected >= len(c.filteredItems) {
+		c.selected = max(0, len(c.filteredItems)-1)
+	}
+
+	// Adjust scroll offset to ensure selected item is visible
+	if c.selected < c.scrollOffset {
+		c.scrollOffset = c.selected
+	} else if c.selected >= c.scrollOffset+maxItems {
+		c.scrollOffset = max(0, c.selected-maxItems+1)
 	}
 }

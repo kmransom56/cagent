@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	latest "github.com/docker/cagent/pkg/config/v2"
+	"github.com/docker/cagent/pkg/config/latest"
 	"github.com/docker/cagent/pkg/tools"
 )
 
@@ -59,7 +59,7 @@ func TestAPITool_GET(t *testing.T) {
 		Endpoint: ts.serverURL + "/api?key=${key}&value=${value}",
 	})
 
-	result, err := tool.handler.CallTool(t.Context(), tools.ToolCall{
+	result, err := tool.callTool(t.Context(), tools.ToolCall{
 		Function: tools.FunctionCall{
 			Arguments: `{"key": "mykey", "value": "myvalue"}`,
 		},
@@ -80,7 +80,7 @@ func TestAPITool_POST(t *testing.T) {
 		Endpoint: ts.serverURL,
 	})
 
-	result, err := tool.handler.CallTool(t.Context(), tools.ToolCall{
+	result, err := tool.callTool(t.Context(), tools.ToolCall{
 		Function: tools.FunctionCall{
 			Arguments: `{"name":"John Doe","age":30}`,
 		},
@@ -112,11 +112,63 @@ func TestAPITool_Headers(t *testing.T) {
 		},
 	})
 
-	result, err := tool.handler.CallTool(t.Context(), tools.ToolCall{})
+	result, err := tool.callTool(t.Context(), tools.ToolCall{})
 
 	require.NoError(t, err)
 	assert.JSONEq(t, `{"status":"ok"}`, result.Output)
 	assert.Equal(t, "custom-value", ts.receivedHeaders.Get("X-Custom-Header"))
 	assert.Equal(t, "secret-key", ts.receivedHeaders.Get("X-API-Key"))
 	assert.Equal(t, "another-value", ts.receivedHeaders.Get("X-Another-Header"))
+}
+
+func TestAPITool_DefaultOutputSchema(t *testing.T) {
+	t.Parallel()
+
+	tool := NewAPITool(latest.APIToolConfig{
+		Name:     "default-schema",
+		Method:   http.MethodGet,
+		Endpoint: "https://example.com/api",
+	})
+
+	toolsList, err := tool.Tools(t.Context())
+	require.NoError(t, err)
+	require.Len(t, toolsList, 1)
+
+	assert.Equal(t, tools.MustSchemaFor[string](), toolsList[0].OutputSchema)
+}
+
+func TestAPITool_CustomOutputSchema(t *testing.T) {
+	t.Parallel()
+
+	customSchema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"first_name": map[string]any{"type": "string"},
+			"last_name":  map[string]any{"type": "string"},
+			"age":        map[string]any{"type": "number"},
+		},
+		"required": []string{"first_name", "last_name"},
+	}
+
+	tool := NewAPITool(latest.APIToolConfig{
+		Name:         "user-info",
+		Method:       http.MethodGet,
+		Endpoint:     "https://example.com/api/users/${id}",
+		Required:     []string{"id"},
+		Args:         map[string]any{"id": map[string]any{"type": "number"}},
+		OutputSchema: customSchema,
+	})
+
+	toolsList, err := tool.Tools(t.Context())
+	require.NoError(t, err)
+	require.Len(t, toolsList, 1)
+
+	schema, ok := toolsList[0].OutputSchema.(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "object", schema["type"])
+
+	props, ok := schema["properties"].(map[string]any)
+	require.True(t, ok)
+	assert.Contains(t, props, "first_name")
+	assert.Contains(t, props, "age")
 }

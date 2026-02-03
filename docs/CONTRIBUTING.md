@@ -15,6 +15,10 @@ If you're hacking on `cagent`, or just want to be on the bleeding edge, then bui
 - [Task 3.44 or higher](https://taskfile.dev/installation/)
 - [`golangci-lint`](https://golangci-lint.run/docs/welcome/install/#binaries)
 
+> Note: On windows, we currently only support building from source via docker with `task build-local`  
+>
+> See [here](#building-with-docker) for more details
+
 ##### Build commands
 
 ```bash
@@ -77,14 +81,10 @@ cd cagent
 cagent run ./golang_developer.yaml
 ```
 
-This agent is an *expert Golang developer specializing in the cagent multi-agent AI system architecture*.
+This agent is an *expert Golang developer specializing in the Docker `cagent` multi-agent AI system architecture*.
 
 Ask it anything about `cagent`. It can be questions about the current code or about
 improvements to the code. It can also fix issues and implement new features!
-
-## Project Architecture
-
-More info about the architecture behind `cagent` can be found [here](/docs/architecture.md)
 
 ## Add a new model provider
 

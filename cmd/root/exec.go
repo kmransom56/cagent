@@ -11,20 +11,24 @@ func newExecCmd() *cobra.Command {
 	var flags runExecFlags
 
 	cmd := &cobra.Command{
-		Use:   "exec <agent-name>",
+		Use:   "exec <agent-file>|<registry-ref>",
 		Short: "Execute an agent",
-		Args:  cobra.RangeArgs(1, 2),
-		RunE:  flags.runExecCommand,
+		Long:  "Execute an agent (Single user message / No TUI)",
+		Example: `  cagent exec ./agent.yaml
+  cagent exec ./team.yaml --agent root
+  cagent exec ./echo.yaml "INSTRUCTIONS"
+  echo "INSTRUCTIONS" | cagent exec ./echo.yaml -
+  cagent exec ./agent.yaml "question" --record  # Records to auto-generated file`,
+		GroupID:           "core",
+		ValidArgsFunction: completeRunExec,
+		Args:              cobra.RangeArgs(1, 2),
+		RunE:              flags.runExecCommand,
 	}
 
-	cmd.PersistentFlags().StringVarP(&flags.agentName, "agent", "a", "root", "Name of the agent to run")
-	cmd.PersistentFlags().StringVar(&flags.workingDir, "working-dir", "", "Set the working directory for the session (applies to tools and relative paths)")
-	cmd.PersistentFlags().BoolVar(&flags.autoApprove, "yolo", false, "Automatically approve all tool calls without prompting")
-	cmd.PersistentFlags().StringVar(&flags.attachmentPath, "attach", "", "Attach an image file to the message")
-	cmd.PersistentFlags().StringArrayVar(&flags.modelOverrides, "model", nil, "Override agent model: [agent=]provider/model (repeatable)")
-	cmd.PersistentFlags().BoolVar(&flags.dryRun, "dry-run", false, "Initialize the agent without executing anything")
-
+	addRunOrExecFlags(cmd, &flags)
 	addRuntimeConfigFlags(cmd, &flags.runConfig)
+	cmd.PersistentFlags().BoolVar(&flags.hideToolCalls, "hide-tool-calls", false, "Hide the tool calls in the output")
+	cmd.PersistentFlags().BoolVar(&flags.outputJSON, "json", false, "Output results in JSON format")
 
 	return cmd
 }
@@ -35,5 +39,6 @@ func (f *runExecFlags) runExecCommand(cmd *cobra.Command, args []string) error {
 	ctx := cmd.Context()
 	out := cli.NewPrinter(cmd.OutOrStdout())
 
-	return f.runOrExec(ctx, out, args, true)
+	tui := false
+	return f.runOrExec(ctx, out, args, tui)
 }

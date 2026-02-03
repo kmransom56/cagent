@@ -1,7 +1,9 @@
 package telemetry
 
 import (
+	"cmp"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,7 +11,6 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
-	"github.com/spf13/cobra"
 
 	"github.com/docker/cagent/pkg/paths"
 )
@@ -17,14 +18,21 @@ import (
 // getSystemInfo collects system information for events
 func getSystemInfo() (osName, osVersion, osLanguage string) {
 	osInfo := runtime.GOOS
-	osLang := os.Getenv("LANG")
-	if osLang == "" {
-		osLang = "en-US"
-	}
+	osLang := cmp.Or(os.Getenv("LANG"), "en-US")
 	return osInfo, "", osLang
 }
 
 func GetTelemetryEnabled() bool {
+	// Disable telemetry when running in tests to prevent HTTP calls
+	if flag.Lookup("test.v") != nil {
+		return false
+	}
+	return getTelemetryEnabledFromEnv()
+}
+
+// getTelemetryEnabledFromEnv checks only the environment variable,
+// without the test detection bypass. This allows testing the env var logic.
+func getTelemetryEnabledFromEnv() bool {
 	if env := os.Getenv("TELEMETRY_ENABLED"); env != "" {
 		// Only disable if explicitly set to "false"
 		return env != "false"
@@ -99,55 +107,4 @@ type CommandInfo struct {
 	Action string
 	Args   []string
 	Flags  []string
-}
-
-// BuildCommandInfo extracts detailed command information for telemetry
-func BuildCommandInfo(cmd *cobra.Command, args []string, baseName string) CommandInfo {
-	info := CommandInfo{
-		Action: baseName,
-		Args:   []string{},
-		Flags:  []string{},
-	}
-
-	// Only capture arguments for specific commands where they provide valuable context
-	shouldCaptureArgs := baseName == "run" || baseName == "pull" || baseName == "catalog"
-
-	if shouldCaptureArgs {
-		// Add subcommands from args (first non-flag arguments)
-		for _, arg := range args {
-			if !strings.HasPrefix(arg, "-") {
-				info.Args = append(info.Args, arg)
-			} else {
-				// Stop at first flag
-				break
-			}
-		}
-	}
-
-	// Add important flags that provide context
-	if cmd.Flags() != nil {
-		// Check for help flag
-		if help, _ := cmd.Flags().GetBool("help"); help {
-			info.Flags = append(info.Flags, "--help")
-		}
-
-		// Check for version flag (if it exists)
-		if cmd.Flags().Lookup("version") != nil {
-			if version, _ := cmd.Flags().GetBool("version"); version {
-				info.Flags = append(info.Flags, "--version")
-			}
-		}
-
-		// Check for other commonly used flags (more relevant for run/pull commands)
-		if shouldCaptureArgs {
-			flagsToCheck := []string{"config", "agent", "model", "output", "format", "yolo"}
-			for _, flagName := range flagsToCheck {
-				if flag := cmd.Flags().Lookup(flagName); flag != nil && flag.Changed {
-					info.Flags = append(info.Flags, "--"+flagName)
-				}
-			}
-		}
-	}
-
-	return info
 }

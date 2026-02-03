@@ -1,6 +1,7 @@
 package oci
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -8,25 +9,29 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/docker/cagent/pkg/config"
 	"github.com/docker/cagent/pkg/content"
 )
 
 func TestPackageFileAsOCIToStore(t *testing.T) {
-	testFile := filepath.Join(t.TempDir(), "test.yaml")
-	testContent := `name: test-app
-version: v1.0.0
-description: "Test application"
+	agentFilename := filepath.Join(t.TempDir(), "test.yaml")
+	testContent := `version: "2"
+agents:
+  root:
+    model: auto
+    description: A helpful AI assistant
 `
-	require.NoError(t, os.WriteFile(testFile, []byte(testContent), 0o644))
+	require.NoError(t, os.WriteFile(agentFilename, []byte(testContent), 0o644))
 	store, err := content.NewStore(content.WithBaseDir(t.TempDir()))
 	require.NoError(t, err)
 
-	tag := "test-app:v1.0.0"
-	digest, err := PackageFileAsOCIToStore(testFile, tag, store)
+	agentSource, err := config.Resolve(agentFilename)
 	require.NoError(t, err)
 
+	tag := "test-app:v1.0.0"
+	digest, err := PackageFileAsOCIToStore(t.Context(), agentSource, tag, store)
+	require.NoError(t, err)
 	assert.NotEmpty(t, digest)
-
 	t.Cleanup(func() {
 		if err := store.DeleteArtifact(digest); err != nil {
 			t.Logf("Failed to clean up artifact: %v", err)
@@ -35,7 +40,6 @@ description: "Test application"
 
 	img, err := store.GetArtifactImage(tag)
 	require.NoError(t, err)
-
 	assert.NotNil(t, img)
 
 	metadata, err := store.GetArtifactMetadata(tag)
@@ -43,79 +47,77 @@ description: "Test application"
 
 	assert.Equal(t, tag, metadata.Reference)
 	assert.Equal(t, digest, metadata.Digest)
-}
 
-func TestPackageFileAsOCIToStoreMissingFile(t *testing.T) {
-	store, err := content.NewStore(content.WithBaseDir(t.TempDir()))
-	require.NoError(t, err)
-	_, err = PackageFileAsOCIToStore("/non/existent/file.txt", "test:latest", store)
-	require.Error(t, err)
+	// Verify annotations are present
+	require.NotNil(t, metadata.Annotations)
+	assert.Contains(t, metadata.Annotations, "org.opencontainers.image.created")
+	assert.Contains(t, metadata.Annotations, "org.opencontainers.image.description")
+	assert.Equal(t, "OCI artifact containing test.yaml", metadata.Annotations["org.opencontainers.image.description"])
 }
 
 func TestPackageFileAsOCIToStoreInvalidTag(t *testing.T) {
-	testFile := filepath.Join(t.TempDir(), "test.txt")
-	require.NoError(t, os.WriteFile(testFile, []byte("test content"), 0o644))
+	agentFilename := filepath.Join(t.TempDir(), "test.txt")
+	require.NoError(t, os.WriteFile(agentFilename, []byte("test content"), 0o644))
+
+	agentSource, err := config.Resolve(agentFilename)
+	require.NoError(t, err)
 
 	store, err := content.NewStore(content.WithBaseDir(t.TempDir()))
 	require.NoError(t, err)
-	_, err = PackageFileAsOCIToStore(testFile, "", store)
+	_, err = PackageFileAsOCIToStore(t.Context(), agentSource, "", store)
 	require.Error(t, err)
 }
 
-func TestPackageFileAsOCIToStoreDifferentFileTypes(t *testing.T) {
-	testCases := []struct {
-		name     string
-		filename string
-		content  string
-		tag      string
-	}{
-		{
-			name:     "yaml file",
-			filename: "config.yaml",
-			content:  "key: value\nother: data",
-			tag:      "config:yaml",
-		},
-		{
-			name:     "json file",
-			filename: "data.json",
-			content:  `{"key": "value", "number": 42}`,
-			tag:      "data:json",
-		},
-		{
-			name:     "text file",
-			filename: "readme.txt",
-			content:  "This is a simple text file\nwith multiple lines",
-			tag:      "readme:txt",
-		},
-	}
+func TestPackageFileAsOCIToStore_WithProviders(t *testing.T) {
+	// Test that configs with providers are correctly marshalled when packaged
+	// This is important because configs without version get re-marshalled
+	agentFilename := filepath.Join(t.TempDir(), "test.yaml")
+	testContent := `providers:
+  my_gateway:
+    api_type: openai_chatcompletions
+    base_url: http://localhost:8080
+    token_key: MY_API_KEY
 
+agents:
+  root:
+    model: my_gateway/gpt-4o
+    description: Test agent
+`
+	require.NoError(t, os.WriteFile(agentFilename, []byte(testContent), 0o644))
 	store, err := content.NewStore(content.WithBaseDir(t.TempDir()))
 	require.NoError(t, err)
 
-	var digests []string
+	agentSource, err := config.Resolve(agentFilename)
+	require.NoError(t, err)
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			testFile := filepath.Join(t.TempDir(), tc.filename)
-			require.NoError(t, os.WriteFile(testFile, []byte(tc.content), 0o644))
-
-			// Package the file as OCI artifact
-			digest, err := PackageFileAsOCIToStore(testFile, tc.tag, store)
-			require.NoError(t, err)
-
-			digests = append(digests, digest)
-
-			img, err := store.GetArtifactImage(tc.tag)
-			require.NoError(t, err)
-			assert.NotNil(t, img)
-		})
-	}
+	tag := "test-providers:v1.0.0"
+	digest, err := PackageFileAsOCIToStore(t.Context(), agentSource, tag, store)
+	require.NoError(t, err)
+	assert.NotEmpty(t, digest)
 
 	t.Cleanup(func() {
-		for _, digest := range digests {
-			if err := store.DeleteArtifact(digest); err != nil {
-				t.Logf("Failed to clean up artifact %s: %v", digest, err)
-			}
-		}
+		_ = store.DeleteArtifact(digest)
 	})
+
+	// Pull the artifact and verify providers are preserved
+	img, err := store.GetArtifactImage(tag)
+	require.NoError(t, err)
+
+	layers, err := img.Layers()
+	require.NoError(t, err)
+	require.Len(t, layers, 1)
+
+	reader, err := layers[0].Uncompressed()
+	require.NoError(t, err)
+	defer reader.Close()
+
+	data, err := io.ReadAll(reader)
+	require.NoError(t, err)
+
+	// Verify the providers section is present with correct keys
+	assert.Contains(t, string(data), "providers:")
+	assert.Contains(t, string(data), "my_gateway:")
+	assert.Contains(t, string(data), "api_type:")
+	assert.Contains(t, string(data), "base_url:")
+	assert.Contains(t, string(data), "token_key:")
 }

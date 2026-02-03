@@ -1,20 +1,31 @@
 package editor
 
 import (
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
+	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/textarea"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/atotto/clipboard"
+	"github.com/docker/go-units"
 	"github.com/mattn/go-runewidth"
+	"github.com/rivo/uniseg"
 
 	"github.com/docker/cagent/pkg/app"
 	"github.com/docker/cagent/pkg/history"
+	"github.com/docker/cagent/pkg/paths"
 	"github.com/docker/cagent/pkg/tui/components/completion"
 	"github.com/docker/cagent/pkg/tui/components/editor/completions"
 	"github.com/docker/cagent/pkg/tui/core"
 	"github.com/docker/cagent/pkg/tui/core/layout"
+	"github.com/docker/cagent/pkg/tui/messages"
 	"github.com/docker/cagent/pkg/tui/styles"
 )
 
@@ -22,8 +33,26 @@ import (
 // computing layout measurements.
 var ansiRegexp = regexp.MustCompile(`\x1b\[[0-9;]*[A-Za-z]`)
 
-// SendMsg represents a message to send
-type SendMsg struct {
+const (
+	// maxInlinePasteLines is the maximum number of lines for inline paste.
+	// Pastes exceeding this are buffered to a temp file attachment.
+	maxInlinePasteLines = 5
+	// maxInlinePasteChars is the character limit for inline pastes.
+	// This catches very long single-line pastes that would clutter the editor.
+	maxInlinePasteChars = 500
+)
+
+type attachment struct {
+	path        string // Path to file (temp for pastes, real for file refs)
+	placeholder string // @paste-1 or @filename
+	label       string // Display label like "paste-1 (21.1 KB)"
+	sizeBytes   int
+	isTemp      bool // True for paste temp files that need cleanup
+}
+
+// AttachmentPreview describes an attachment and its contents for dialog display.
+type AttachmentPreview struct {
+	Title   string
 	Content string
 }
 
@@ -33,12 +62,31 @@ type Editor interface {
 	layout.Sizeable
 	layout.Focusable
 	SetWorking(working bool) tea.Cmd
-	AcceptSuggestion() bool
+	AcceptSuggestion() tea.Cmd
+	ScrollByWheel(delta int)
+	// Value returns the current editor content
+	Value() string
+	// SetValue updates the editor content
+	SetValue(content string)
+	// InsertText inserts text at the current cursor position
+	InsertText(text string)
+	// AttachFile adds a file as an attachment and inserts @filepath into the editor
+	AttachFile(filePath string)
+	Cleanup()
+	GetSize() (width, height int)
+	BannerHeight() int
+	AttachmentAt(x int) (AttachmentPreview, bool)
+	// SetRecording sets the recording mode which shows animated dots as the cursor
+	SetRecording(recording bool) tea.Cmd
+	// IsRecording returns true if the editor is in recording mode
+	IsRecording() bool
+	// SendContent triggers sending the current editor content
+	SendContent() tea.Cmd
 }
 
 // editor implements [Editor]
 type editor struct {
-	textarea *textarea.Model
+	textarea textarea.Model
 	hist     *history.History
 	width    int
 	height   int
@@ -52,27 +100,48 @@ type editor struct {
 
 	suggestion    string
 	hasSuggestion bool
-	cursorHidden  bool
+	// userTyped tracks whether the user has manually typed content (vs loaded from history)
+	userTyped bool
+	// keyboardEnhancementsSupported tracks whether the terminal supports keyboard enhancements
+	keyboardEnhancementsSupported bool
+	// pendingFileRef tracks the current @word being typed (for manual file ref detection).
+	// Only set when cursor is in a word starting with @, cleared when cursor leaves.
+	pendingFileRef string
+	// banner renders pending attachments so the user can see what's queued.
+	banner *attachmentBanner
+	// attachments tracks all file attachments (pastes and file refs).
+	attachments []attachment
+	// pasteCounter tracks the next paste number for display purposes.
+	pasteCounter int
+	// recording tracks whether the editor is in recording mode (speech-to-text)
+	recording bool
+	// recordingDotPhase tracks the animation phase for the recording dots cursor
+	recordingDotPhase int
 }
 
 // New creates a new editor component
 func New(a *app.App, hist *history.History) Editor {
 	ta := textarea.New()
 	ta.SetStyles(styles.InputStyle)
-	ta.Placeholder = "Type your message here..."
-	ta.Prompt = "│ "
+	ta.Placeholder = "Type your message here…"
+	ta.Prompt = ""
 	ta.CharLimit = -1
 	ta.SetWidth(50)
 	ta.SetHeight(3) // Set minimum 3 lines for multi-line input
 	ta.Focus()
 	ta.ShowLineNumbers = false
-	ta.KeyMap.InsertNewline.SetEnabled(true) // Enable newline insertion
 
-	return &editor{
-		textarea:    ta,
-		hist:        hist,
-		completions: completions.Completions(a),
+	e := &editor{
+		textarea:                      ta,
+		hist:                          hist,
+		completions:                   completions.Completions(a),
+		keyboardEnhancementsSupported: false,
+		banner:                        newAttachmentBanner(),
 	}
+
+	e.configureNewlineKeybinding()
+
+	return e
 }
 
 // Init initializes the component
@@ -97,44 +166,235 @@ func lineHasContent(line, prompt string) bool {
 	return strings.TrimSpace(plain) != ""
 }
 
-// lastInputLine returns the content of the final line from the textarea value,
-// which is the portion eligible for suggestions.
-func lastInputLine(value string) string {
-	if idx := strings.LastIndex(value, "\n"); idx >= 0 {
-		return value[idx+1:]
+// extractLineText extracts the user input text from a rendered view line,
+// stripping ANSI codes and the prompt prefix.
+func extractLineText(line, prompt string) string {
+	plain := stripANSI(line)
+	if prompt != "" && strings.HasPrefix(plain, prompt) {
+		plain = strings.TrimPrefix(plain, prompt)
 	}
-	return value
+	return strings.TrimRight(plain, " ")
+}
+
+// computeWrappedLines uses a textarea to compute how text would be wrapped,
+// matching the textarea's word-wrap behavior exactly.
+func (e *editor) computeWrappedLines(text string, startOffset int) []string {
+	// Create a temporary textarea with the same settings
+	ta := textarea.New()
+	ta.Prompt = e.textarea.Prompt
+	ta.ShowLineNumbers = e.textarea.ShowLineNumbers
+	ta.SetWidth(e.textarea.Width())
+	ta.SetHeight(100) // Large enough to see all wrapped lines
+
+	// For the first line, we need to account for the cursor position.
+	// We do this by prefixing with spaces to simulate the existing text.
+	prefix := strings.Repeat(" ", startOffset)
+	ta.SetValue(prefix + text)
+
+	view := ta.View()
+	viewLines := strings.Split(view, "\n")
+
+	// Extract the text content from each visual line
+	var result []string
+	for i, line := range viewLines {
+		plain := extractLineText(line, ta.Prompt)
+		if i == 0 {
+			// First line: remove the prefix spaces we added
+			if len(plain) >= startOffset {
+				plain = plain[startOffset:]
+			}
+		}
+		// Stop at empty lines (end of content)
+		if plain == "" && i > 0 {
+			break
+		}
+		result = append(result, plain)
+	}
+
+	if len(result) == 0 {
+		result = []string{text}
+	}
+
+	return result
 }
 
 // applySuggestionOverlay draws the inline suggestion on top of the textarea
-// view using the configured ghost style.
+// view using the configured ghost style. The first character appears with
+// cursor styling (reverse video) so it's visible inside the cursor block.
+// Multi-line suggestions are rendered across multiple visual lines.
 func (e *editor) applySuggestionOverlay(view string) string {
 	lines := strings.Split(view, "\n")
-	targetLine := -1
-	for i := len(lines) - 1; i >= 0; i-- {
-		if lineHasContent(lines[i], e.textarea.Prompt) {
-			targetLine = i
-			break
+	value := e.textarea.Value()
+	promptWidth := runewidth.StringWidth(stripANSI(e.textarea.Prompt))
+
+	// Use LineInfo to get the actual cursor position within soft-wrapped lines
+	lineInfo := e.textarea.LineInfo()
+
+	// The cursor's column offset within the current visual line
+	textWidth := lineInfo.ColumnOffset
+
+	// Determine the target visual line for the overlay.
+	// For soft-wrapped text, we need to find where the cursor actually is.
+	var targetLine int
+
+	if strings.HasSuffix(value, "\n") {
+		// Cursor is on the line after the last content line.
+		// Find the first empty line after content.
+		contentLine := -1
+		for i := len(lines) - 1; i >= 0; i-- {
+			if lineHasContent(lines[i], e.textarea.Prompt) {
+				contentLine = i
+				break
+			}
+		}
+		if contentLine == -1 {
+			return view // No content found
+		}
+		// The cursor line is the one after the content line
+		targetLine = contentLine + 1
+		if targetLine >= len(lines) {
+			// Edge case: cursor line is beyond view (shouldn't happen normally)
+			targetLine = contentLine
+			textWidth = runewidth.StringWidth(extractLineText(lines[targetLine], e.textarea.Prompt))
+		}
+	} else {
+		// For normal text (including soft-wrapped), use the row offset from LineInfo
+		// to find the correct visual line within the viewport.
+		// LineInfo().RowOffset gives us how many visual rows down the cursor is
+		// from the start of the current logical line.
+
+		// First, find the last visual line with content
+		lastContentLine := -1
+		for i := len(lines) - 1; i >= 0; i-- {
+			if lineHasContent(lines[i], e.textarea.Prompt) {
+				lastContentLine = i
+				break
+			}
+		}
+		if lastContentLine == -1 {
+			return view
+		}
+
+		// Calculate the target line based on the logical line's row offset
+		// For multi-line content, we need to account for previous lines
+		logicalLine := e.textarea.Line()
+		rowOffset := lineInfo.RowOffset
+
+		// Count how many visual lines come before the current logical line
+		visualLinesBeforeCursor := 0
+		valueLines := strings.Split(value, "\n")
+		for i := 0; i < logicalLine && i < len(valueLines); i++ {
+			lineWidth := runewidth.StringWidth(valueLines[i])
+			editorWidth := e.textarea.Width()
+			if editorWidth > 0 {
+				// Each logical line takes at least 1 visual line, plus extra for wrapping
+				visualLinesBeforeCursor += 1 + lineWidth/editorWidth
+			} else {
+				visualLinesBeforeCursor++
+			}
+		}
+
+		targetLine = visualLinesBeforeCursor + rowOffset
+
+		// Clamp to valid range
+		if targetLine >= len(lines) {
+			targetLine = lastContentLine
+		}
+		targetLine = max(targetLine, 0)
+	}
+
+	// Use textarea's word-wrap logic to compute how the suggestion would be displayed.
+	// This ensures the suggestion wraps at the same points as when the text is accepted.
+	wrappedLines := e.computeWrappedLines(e.suggestion, textWidth)
+
+	baseLayer := lipgloss.NewLayer(view)
+	var overlays []*lipgloss.Layer
+
+	for i, suggLine := range wrappedLines {
+		if suggLine == "" && i > 0 {
+			// Empty line in middle of suggestion - skip but keep line count
+			continue
+		}
+
+		currentY := targetLine + i
+		// Note: We intentionally don't skip lines beyond the view.
+		// Lipgloss canvas will extend the output to accommodate overlays
+		// that are positioned beyond the base layer's boundaries.
+
+		var xOffset int
+		if i == 0 {
+			// First line starts at cursor position
+			xOffset = promptWidth + textWidth
+		} else {
+			// Subsequent lines start at the prompt position (column 0 after prompt)
+			xOffset = promptWidth
+		}
+
+		if i == 0 {
+			// First line: first character gets cursor styling, rest gets ghost styling
+			firstRune, restOfLine := splitFirstRune(suggLine)
+			cursorChar := styles.SuggestionCursorStyle.Render(firstRune)
+
+			cursorOverlay := lipgloss.NewLayer(cursorChar).
+				X(xOffset).
+				Y(currentY)
+			overlays = append(overlays, cursorOverlay)
+
+			if restOfLine != "" {
+				ghostRest := styles.SuggestionGhostStyle.Render(restOfLine)
+				restOverlay := lipgloss.NewLayer(ghostRest).
+					X(xOffset + runewidth.StringWidth(firstRune)).
+					Y(currentY)
+				overlays = append(overlays, restOverlay)
+			}
+		} else {
+			// Subsequent lines: all ghost styling
+			ghostLine := styles.SuggestionGhostStyle.Render(suggLine)
+			lineOverlay := lipgloss.NewLayer(ghostLine).
+				X(xOffset).
+				Y(currentY)
+			overlays = append(overlays, lineOverlay)
 		}
 	}
 
-	if targetLine == -1 {
+	if len(overlays) == 0 {
 		return view
 	}
 
-	currentLine := lastInputLine(e.textarea.Value())
-	promptWidth := runewidth.StringWidth(stripANSI(e.textarea.Prompt))
-	textWidth := runewidth.StringWidth(currentLine)
+	// Build canvas with all layers
+	allLayers := make([]*lipgloss.Layer, 0, len(overlays)+1)
+	allLayers = append(allLayers, baseLayer)
+	allLayers = append(allLayers, overlays...)
 
-	ghost := styles.SuggestionGhostStyle.Render(e.suggestion)
-
-	baseLayer := lipgloss.NewLayer(view)
-	overlay := lipgloss.NewLayer(ghost).
-		X(promptWidth + textWidth).
-		Y(targetLine)
-
-	canvas := lipgloss.NewCanvas(baseLayer, overlay)
+	canvas := lipgloss.NewCanvas(allLayers...)
 	return canvas.Render()
+}
+
+// splitFirstRune splits a string into its first rune and the rest.
+func splitFirstRune(s string) (string, string) {
+	if s == "" {
+		return "", ""
+	}
+	runes := []rune(s)
+	return string(runes[0]), string(runes[1:])
+}
+
+// deleteLastGraphemeCluster removes the last grapheme cluster from the string.
+// This handles multi-codepoint characters like emoji sequences correctly.
+func deleteLastGraphemeCluster(s string) string {
+	if s == "" {
+		return s
+	}
+
+	// Iterate through grapheme clusters to find where the last one starts
+	var lastClusterStart int
+	gr := uniseg.NewGraphemes(s)
+	for gr.Next() {
+		start, _ := gr.Positions()
+		lastClusterStart = start
+	}
+
+	return s[:lastClusterStart]
 }
 
 // refreshSuggestion updates the cached suggestion to reflect the current
@@ -145,8 +405,22 @@ func (e *editor) refreshSuggestion() {
 		return
 	}
 
+	// Don't show history suggestions when completion popup is active.
+	// The completion's selected item takes precedence.
+	if e.currentCompletion != nil {
+		return
+	}
+
 	current := e.textarea.Value()
 	if current == "" {
+		e.clearSuggestion()
+		return
+	}
+
+	// Only show suggestions when cursor is at the end of the text.
+	// If cursor is not at the end, moving left/right would cause the
+	// suggestion overlay to overwrite existing characters.
+	if !e.isCursorAtEnd() {
 		e.clearSuggestion()
 		return
 	}
@@ -165,35 +439,51 @@ func (e *editor) refreshSuggestion() {
 	}
 
 	e.hasSuggestion = true
-	e.setCursorHidden(true)
+	// Keep cursor visible - suggestion is rendered as overlay after cursor position
 }
 
-// clearSuggestion removes any pending suggestion and restores the cursor.
+// clearSuggestion removes any pending suggestion.
 func (e *editor) clearSuggestion() {
-	if !e.hasSuggestion && !e.cursorHidden {
+	if !e.hasSuggestion {
 		return
 	}
 	e.hasSuggestion = false
 	e.suggestion = ""
-	e.setCursorHidden(false)
 }
 
-// setCursorHidden toggles the virtual cursor so the ghost suggestion can be
-// displayed without visual conflicts.
-func (e *editor) setCursorHidden(hidden bool) {
-	if e.cursorHidden == hidden || e.textarea == nil {
-		return
+// isCursorAtEnd returns true if the cursor is at the end of the text.
+func (e *editor) isCursorAtEnd() bool {
+	value := e.textarea.Value()
+	if value == "" {
+		return true
 	}
 
-	e.cursorHidden = hidden
-	e.textarea.SetVirtualCursor(!hidden)
+	// Check if cursor is on the last logical line
+	lines := strings.Split(value, "\n")
+	lastLineIdx := len(lines) - 1
+	if e.textarea.Line() != lastLineIdx {
+		return false
+	}
+
+	// Check if cursor is at the end of the last line
+	lastLine := lines[lastLineIdx]
+	lastLineLen := len([]rune(lastLine))
+	lineInfo := e.textarea.LineInfo()
+
+	// For soft-wrapped lines, we need to calculate the total character position
+	// from the start of the logical line. CharOffset is relative to the visual line,
+	// so we need to add the characters from previous visual rows.
+	// StartColumn gives us the character index where the current visual line starts.
+	totalCharPos := lineInfo.StartColumn + lineInfo.ColumnOffset
+
+	return totalCharPos >= lastLineLen
 }
 
 // AcceptSuggestion applies the current suggestion into the textarea value and
-// returns true when a suggestion was committed.
-func (e *editor) AcceptSuggestion() bool {
+// returns a command to update the completion query, or nil if no suggestion was applied.
+func (e *editor) AcceptSuggestion() tea.Cmd {
 	if !e.hasSuggestion || e.suggestion == "" {
-		return false
+		return nil
 	}
 
 	current := e.textarea.Value()
@@ -202,65 +492,234 @@ func (e *editor) AcceptSuggestion() bool {
 
 	e.clearSuggestion()
 
-	return true
+	// Update the completion query to reflect the new editor content
+	return e.updateCompletionQuery()
+}
+
+func (e *editor) ScrollByWheel(delta int) {
+	if delta == 0 {
+		return
+	}
+
+	steps := delta
+	if steps < 0 {
+		steps = -steps
+		for range steps {
+			e.textarea.CursorUp()
+		}
+		return
+	}
+
+	for range steps {
+		e.textarea.CursorDown()
+	}
+}
+
+// resetAndSend prepares a message for sending: processes pending file refs,
+// collects attachments, resets editor state, and returns the SendMsg command.
+func (e *editor) resetAndSend(content string) tea.Cmd {
+	e.tryAddFileRef(e.pendingFileRef)
+	e.pendingFileRef = ""
+	attachments := e.collectAttachments(content)
+	e.textarea.Reset()
+	e.userTyped = false
+	e.clearSuggestion()
+	return core.CmdHandler(messages.SendMsg{Content: content, Attachments: attachments})
+}
+
+// configureNewlineKeybinding sets up the appropriate newline keybinding
+// based on terminal keyboard enhancement support.
+func (e *editor) configureNewlineKeybinding() {
+	// Configure textarea's InsertNewline binding based on terminal capabilities
+	if e.keyboardEnhancementsSupported {
+		// Modern terminals:
+		e.textarea.KeyMap.InsertNewline.SetKeys("shift+enter", "ctrl+j")
+		e.textarea.KeyMap.InsertNewline.SetEnabled(true)
+	} else {
+		// Legacy terminals:
+		e.textarea.KeyMap.InsertNewline.SetKeys("ctrl+j")
+		e.textarea.KeyMap.InsertNewline.SetEnabled(true)
+	}
 }
 
 // Update handles messages and updates the component state
 func (e *editor) Update(msg tea.Msg) (layout.Model, tea.Cmd) {
+	defer e.updateAttachmentBanner()
+
 	var cmds []tea.Cmd
 	switch msg := msg.(type) {
+	case recordingDotsTickMsg:
+		if !e.recording {
+			return e, nil
+		}
+		// Cycle through dot phases: "·", "··", "···"
+		e.recordingDotPhase = (e.recordingDotPhase + 1) % 4
+		dots := strings.Repeat("·", e.recordingDotPhase)
+		if e.recordingDotPhase == 0 {
+			dots = ""
+		}
+		e.textarea.Placeholder = "🎤 Listening" + dots
+		cmd := e.tickRecordingDots()
+		return e, cmd
+	case tea.PasteMsg:
+		if e.handlePaste(msg.Content) {
+			return e, nil
+		}
+	case tea.KeyboardEnhancementsMsg:
+		// Track keyboard enhancement support and configure newline keybinding accordingly
+		e.keyboardEnhancementsSupported = msg.Flags != 0
+		e.configureNewlineKeybinding()
+		return e, nil
+	case messages.ThemeChangedMsg:
+		e.textarea.SetStyles(styles.InputStyle)
+		return e, nil
 	case tea.WindowSizeMsg:
 		e.textarea.SetWidth(msg.Width - 2)
 		return e, nil
-	case completion.SelectedMsg:
-		currentValue := e.textarea.Value()
-		lastIdx := strings.LastIndex(currentValue, e.completionWord)
-		if e.currentCompletion.AutoSubmit() {
-			if lastIdx >= 0 {
-				newValue := currentValue[:lastIdx-1]
-				e.textarea.SetValue(newValue)
-				e.textarea.MoveToEnd()
-			}
-			if msg.Execute != nil {
-				return e, msg.Execute()
-			}
-		} else {
-			if lastIdx >= 0 {
-				newValue := currentValue[:lastIdx-1] + msg.Value + currentValue[lastIdx+len(e.completionWord):]
-				e.textarea.SetValue(newValue)
-				e.textarea.MoveToEnd()
-			}
-			return e, nil
+
+	// Handle mouse events
+	case tea.MouseWheelMsg:
+		// Forward mouse wheel as cursor movements to textarea for scrolling
+		// This bypasses history navigation and allows viewport scrolling
+		switch msg.Button.String() {
+		case "wheelup":
+			// Move cursor up (scrolls viewport if needed)
+			e.textarea.CursorUp()
+		case "wheeldown":
+			// Move cursor down (scrolls viewport if needed)
+			e.textarea.CursorDown()
 		}
+		return e, nil
+
+	case tea.MouseClickMsg, tea.MouseMotionMsg, tea.MouseReleaseMsg:
+		var cmd tea.Cmd
+		e.textarea, cmd = e.textarea.Update(msg)
+		// Give focus to editor on click
+		if _, ok := msg.(tea.MouseClickMsg); ok {
+			return e, tea.Batch(cmd, e.Focus())
+		}
+		return e, cmd
+
+	case completion.SelectedMsg:
+		if e.currentCompletion.AutoSubmit() {
+			// For auto-submit completions (like commands), use the selected
+			// command value (e.g., "/exit") instead of what the user typed
+			// (e.g., "/e"). Append any extra text after the trigger word
+			// to preserve arguments (e.g., "/export /tmp/file").
+			triggerWord := e.currentCompletion.Trigger() + e.completionWord
+			extraText := ""
+			if _, after, found := strings.Cut(e.textarea.Value(), triggerWord); found {
+				extraText = after
+			}
+			cmd := e.resetAndSend(msg.Value + extraText)
+			return e, cmd
+		}
+		// For non-auto-submit completions (like file paths), replace the completion word
+		currentValue := e.textarea.Value()
+		if lastIdx := strings.LastIndex(currentValue, e.completionWord); lastIdx >= 0 {
+			newValue := currentValue[:lastIdx-1] + msg.Value + currentValue[lastIdx+len(e.completionWord):]
+			e.textarea.SetValue(newValue)
+			e.textarea.MoveToEnd()
+		}
+		// Track file references when using @ completion (but not paste placeholders)
+		if e.currentCompletion != nil && e.currentCompletion.Trigger() == "@" && !strings.HasPrefix(msg.Value, "@paste-") {
+			e.addFileAttachment(msg.Value)
+		}
+		e.clearSuggestion()
 		return e, nil
 	case completion.ClosedMsg:
 		e.completionWord = ""
+		e.currentCompletion = nil
+		e.clearSuggestion()
+		e.refreshSuggestion()
+		return e, e.textarea.Focus()
+	case completion.SelectionChangedMsg:
+		// Show the selected completion item as a suggestion in the editor
+		if msg.Value != "" && e.currentCompletion != nil {
+			// Calculate the suggestion: what needs to be added after current text
+			currentText := e.textarea.Value()
+			if strings.HasPrefix(msg.Value, currentText) {
+				e.suggestion = msg.Value[len(currentText):]
+				e.hasSuggestion = e.suggestion != ""
+			} else {
+				e.clearSuggestion()
+			}
+		} else {
+			e.clearSuggestion()
+		}
 		return e, nil
 	case tea.KeyPressMsg:
-		switch msg.String() {
-		case "enter":
+		if key.Matches(msg, e.textarea.KeyMap.Paste) {
+			return e.handleClipboardPaste()
+		}
+
+		// Handle backspace with grapheme cluster awareness.
+		// The default textarea.Model only deletes a single rune, which breaks
+		// multi-codepoint characters like emoji (e.g., ⚠️ = U+26A0 + U+FE0F).
+		if key.Matches(msg, e.textarea.KeyMap.DeleteCharacterBackward) {
+			return e.handleGraphemeBackspace()
+		}
+
+		// Handle send/newline keys:
+		// - Enter: submit current input (if textarea inserted a newline, submit previous buffer).
+		// - Shift+Enter: insert newline when keyboard enhancements are supported.
+		// - Ctrl+J: fallback to insert '\n' when keyboard enhancements are not supported.
+		if msg.String() == "enter" || key.Matches(msg, e.textarea.KeyMap.InsertNewline) {
 			if !e.textarea.Focused() {
 				return e, nil
 			}
+
+			// Let textarea process the key - it handles newlines via InsertNewline binding
+			prev := e.textarea.Value()
+			e.textarea, _ = e.textarea.Update(msg)
 			value := e.textarea.Value()
-			if value != "" && !e.working {
-				e.textarea.Reset()
+
+			// If textarea inserted a newline, just refresh and return
+			if value != prev && msg.String() != "enter" {
 				e.refreshSuggestion()
-				return e, core.CmdHandler(SendMsg{Content: value})
+				return e, nil
 			}
+
+			// If plain enter and textarea inserted a newline, submit the previous value
+			if value != prev && msg.String() == "enter" {
+				if prev != "" {
+					e.textarea.SetValue(prev)
+					e.textarea.MoveToEnd()
+					cmd := e.resetAndSend(prev)
+					return e, cmd
+				}
+				return e, nil
+			}
+
+			// Normal enter submit: send current value
+			if value != "" {
+				cmd := e.resetAndSend(value)
+				return e, cmd
+			}
+
 			return e, nil
-		case "ctrl+c":
-			return e, tea.Quit
+		}
+
+		// Handle other special keys
+		switch msg.String() {
 		case "up":
-			e.textarea.SetValue(e.hist.Previous())
-			e.textarea.MoveToEnd()
-			e.refreshSuggestion()
-			return e, nil
+			// Only navigate history if the user hasn't manually typed content
+			if !e.userTyped {
+				e.textarea.SetValue(e.hist.Previous())
+				e.textarea.MoveToEnd()
+				e.refreshSuggestion()
+				return e, nil
+			}
+			// Otherwise, let the textarea handle cursor navigation
 		case "down":
-			e.textarea.SetValue(e.hist.Next())
-			e.textarea.MoveToEnd()
-			e.refreshSuggestion()
-			return e, nil
+			// Only navigate history if the user hasn't manually typed content
+			if !e.userTyped {
+				e.textarea.SetValue(e.hist.Next())
+				e.textarea.MoveToEnd()
+				e.refreshSuggestion()
+				return e, nil
+			}
+			// Otherwise, let the textarea handle cursor navigation
 		default:
 			for _, completion := range e.completions {
 				if msg.String() == completion.Trigger() {
@@ -273,25 +732,44 @@ func (e *editor) Update(msg tea.Msg) (layout.Model, tea.Cmd) {
 		}
 	}
 
+	prevValue := e.textarea.Value()
 	var cmd tea.Cmd
 	e.textarea, cmd = e.textarea.Update(msg)
 	cmds = append(cmds, cmd)
 
+	// If the value changed due to user input (not history navigation), mark as user typed
 	if keyMsg, ok := msg.(tea.KeyPressMsg); ok {
-		if keyMsg.String() == "space" {
-			e.completionWord = ""
-			e.currentCompletion = nil
-			cmds = append(cmds, core.CmdHandler(completion.CloseMsg{}))
+		// Check if content changed and it wasn't a history navigation key
+		if e.textarea.Value() != prevValue && keyMsg.String() != "up" && keyMsg.String() != "down" {
+			e.userTyped = true
+		}
+
+		// Also check if textarea became empty - reset userTyped flag
+		if e.textarea.Value() == "" {
+			e.userTyped = false
 		}
 
 		currentWord := e.textarea.Word()
-		if e.currentCompletion != nil && strings.HasPrefix(currentWord, e.currentCompletion.Trigger()) {
-			e.completionWord = currentWord[1:]
-			cmds = append(cmds, core.CmdHandler(completion.QueryMsg{Query: e.completionWord}))
-		} else {
-			e.completionWord = ""
-			cmds = append(cmds, core.CmdHandler(completion.CloseMsg{}))
+
+		// Track manual @filepath refs - only runs when we're in/leaving an @ word
+		if e.pendingFileRef != "" && currentWord != e.pendingFileRef {
+			// Left the @ word - try to add it as file ref
+			e.tryAddFileRef(e.pendingFileRef)
+			e.pendingFileRef = ""
 		}
+		if e.pendingFileRef == "" && strings.HasPrefix(currentWord, "@") && len(currentWord) > 1 {
+			// Entered an @ word - start tracking
+			e.pendingFileRef = currentWord
+		} else if e.pendingFileRef != "" && strings.HasPrefix(currentWord, "@") {
+			// Still in @ word but it changed (user typing more) - update tracking
+			e.pendingFileRef = currentWord
+		}
+
+		if keyMsg.String() == "space" {
+			e.currentCompletion = nil
+		}
+
+		cmds = append(cmds, e.updateCompletionQuery())
 	}
 
 	e.refreshSuggestion()
@@ -299,11 +777,171 @@ func (e *editor) Update(msg tea.Msg) (layout.Model, tea.Cmd) {
 	return e, tea.Batch(cmds...)
 }
 
+func (e *editor) handleClipboardPaste() (layout.Model, tea.Cmd) {
+	content, err := clipboard.ReadAll()
+	if err != nil {
+		slog.Warn("failed to read clipboard", "error", err)
+		return e, nil
+	}
+
+	// handlePaste returns true if content was buffered to disk (large paste),
+	// false if it's small enough for inline insertion.
+	if !e.handlePaste(content) {
+		e.textarea.InsertString(content)
+	}
+	return e, textarea.Blink
+}
+
+// handleGraphemeBackspace implements backspace with grapheme cluster awareness.
+// It removes the entire last grapheme cluster, not just the last rune.
+// This fixes deletion of multi-codepoint characters like emoji sequences.
+func (e *editor) handleGraphemeBackspace() (layout.Model, tea.Cmd) {
+	value := e.textarea.Value()
+	if value == "" {
+		return e, nil
+	}
+
+	// Get cursor position info
+	lines := strings.Split(value, "\n")
+	currentLine := e.textarea.Line()
+	lineInfo := e.textarea.LineInfo()
+
+	// CharOffset within the current visual line segment
+	colPos := lineInfo.CharOffset + lineInfo.StartColumn
+
+	if currentLine < 0 || currentLine >= len(lines) {
+		return e, nil
+	}
+
+	if colPos == 0 && currentLine > 0 {
+		// At beginning of line but not first line - let textarea handle line merge
+		var cmd tea.Cmd
+		e.textarea, cmd = e.textarea.Update(tea.KeyPressMsg{Code: tea.KeyBackspace})
+		e.refreshSuggestion()
+		return e, tea.Batch(cmd, e.updateCompletionQuery())
+	}
+
+	if colPos == 0 {
+		// At beginning of first line - nothing to delete
+		return e, nil
+	}
+
+	// Delete the last grapheme cluster from the text before the cursor
+	currentLineText := lines[currentLine]
+
+	// Convert column position (based on display width) to rune position
+	runePos := 0
+	width := 0
+	for _, r := range currentLineText {
+		if width >= colPos {
+			break
+		}
+		width += runewidth.RuneWidth(r)
+		runePos++
+	}
+
+	// Text before cursor
+	runes := []rune(currentLineText)
+	if runePos > len(runes) {
+		runePos = len(runes)
+	}
+	beforeCursor := string(runes[:runePos])
+	afterCursor := string(runes[runePos:])
+
+	// Delete the last grapheme cluster from text before cursor
+	newBeforeCursor := deleteLastGraphemeCluster(beforeCursor)
+
+	// Rebuild the line
+	lines[currentLine] = newBeforeCursor + afterCursor
+	newValue := strings.Join(lines, "\n")
+
+	// Calculate new cursor column position within the current line
+	newCol := len([]rune(newBeforeCursor))
+
+	// Build text before cursor position (all lines before current + new before cursor)
+	var beforeParts []string
+	for i := range currentLine {
+		beforeParts = append(beforeParts, lines[i])
+	}
+	beforeParts = append(beforeParts, newBeforeCursor)
+	textBeforeCursor := strings.Join(beforeParts, "\n")
+
+	// Build text after cursor position (after cursor on current line + remaining lines)
+	var textAfterCursor string
+	textAfterCursor = afterCursor
+	for i := currentLine + 1; i < len(lines); i++ {
+		textAfterCursor += "\n" + lines[i]
+	}
+
+	// Set the text before cursor and move to end
+	e.textarea.SetValue(textBeforeCursor)
+	e.textarea.MoveToEnd()
+
+	// Now insert the text after cursor - this positions cursor correctly
+	if textAfterCursor != "" {
+		e.textarea.SetValue(newValue)
+		e.textarea.MoveToBegin()
+
+		// Keep calling CursorDown until we're on the target logical line
+		for e.textarea.Line() < currentLine {
+			e.textarea.CursorDown()
+		}
+
+		e.textarea.SetCursorColumn(newCol)
+	}
+
+	e.refreshSuggestion()
+	return e, tea.Batch(textarea.Blink, e.updateCompletionQuery())
+}
+
+// updateCompletionQuery sends the appropriate completion message based on current editor state.
+// It returns a command that either updates the completion query or closes the completion popup.
+func (e *editor) updateCompletionQuery() tea.Cmd {
+	currentWord := e.textarea.Word()
+
+	if e.currentCompletion != nil && strings.HasPrefix(currentWord, e.currentCompletion.Trigger()) {
+		e.completionWord = strings.TrimPrefix(currentWord, e.currentCompletion.Trigger())
+		return core.CmdHandler(completion.QueryMsg{Query: e.completionWord})
+	}
+
+	e.completionWord = ""
+	return core.CmdHandler(completion.CloseMsg{})
+}
+
 func (e *editor) startCompletion(c completions.Completion) tea.Cmd {
 	e.currentCompletion = c
+	items := c.Items()
+
+	// Prepend paste placeholders for @ trigger so users can easily reference them
+	if c.Trigger() == "@" {
+		pasteItems := e.getPasteCompletionItems()
+		if len(pasteItems) > 0 {
+			items = append(pasteItems, items...)
+		}
+	}
+
 	return core.CmdHandler(completion.OpenMsg{
-		Items: c.Items(),
+		Items:     items,
+		MatchMode: c.MatchMode(),
 	})
+}
+
+// getPasteCompletionItems returns completion items for paste attachments only.
+func (e *editor) getPasteCompletionItems() []completion.Item {
+	var items []completion.Item
+	for _, att := range e.attachments {
+		if !att.isTemp {
+			continue // Only show pastes, not file refs
+		}
+		name := strings.TrimPrefix(att.placeholder, "@")
+		items = append(items, completion.Item{
+			Label:       name,
+			Description: units.HumanSize(float64(att.sizeBytes)),
+			Value:       att.placeholder,
+			Pinned:      true,
+		})
+	}
+	return items
 }
 
 // View renders the component
@@ -314,27 +952,80 @@ func (e *editor) View() string {
 		view = e.applySuggestionOverlay(view)
 	}
 
-	return styles.EditorStyle.Render(view)
+	bannerView := e.banner.View()
+	if bannerView != "" {
+		// Banner is shown - no extra top padding needed
+		view = lipgloss.JoinVertical(lipgloss.Left, bannerView, view)
+	}
+
+	return styles.RenderComposite(styles.EditorStyle.MarginBottom(1), view)
 }
 
 // SetSize sets the dimensions of the component
 func (e *editor) SetSize(width, height int) tea.Cmd {
 	e.width = width
-	e.height = height
+	e.height = max(height, 1)
 
-	// Account for border and padding
-	contentWidth := max(width, 10)
-	contentHeight := max(height, 3) // Minimum 3 lines, but respect height parameter
-
-	e.textarea.SetWidth(contentWidth)
-	e.textarea.SetHeight(contentHeight)
+	e.textarea.SetWidth(max(width, 10))
+	e.updateTextareaHeight()
 
 	return nil
 }
 
-// GetSize returns the current dimensions
+func (e *editor) updateTextareaHeight() {
+	available := e.height
+	if e.banner != nil {
+		available -= e.banner.Height()
+	}
+
+	available = max(available, 1)
+
+	e.textarea.SetHeight(available)
+}
+
+// BannerHeight returns the current height of the attachment banner (0 if hidden)
+func (e *editor) BannerHeight() int {
+	if e.banner == nil {
+		return 0
+	}
+	return e.banner.Height()
+}
+
+// GetSize returns the rendered dimensions including EditorStyle padding.
 func (e *editor) GetSize() (width, height int) {
-	return e.width, e.height
+	return e.width + styles.EditorStyle.GetHorizontalFrameSize(),
+		e.height + styles.EditorStyle.GetVerticalFrameSize()
+}
+
+// AttachmentAt returns preview information for the attachment rendered at the given X position.
+func (e *editor) AttachmentAt(x int) (AttachmentPreview, bool) {
+	if e.banner == nil || e.banner.Height() == 0 {
+		return AttachmentPreview{}, false
+	}
+
+	item, ok := e.banner.HitTest(x)
+	if !ok {
+		return AttachmentPreview{}, false
+	}
+
+	for _, att := range e.attachments {
+		if att.placeholder != item.placeholder {
+			continue
+		}
+
+		data, err := os.ReadFile(att.path)
+		if err != nil {
+			slog.Warn("failed to read attachment preview", "path", att.path, "error", err)
+			return AttachmentPreview{}, false
+		}
+
+		return AttachmentPreview{
+			Title:   item.label,
+			Content: string(data),
+		}, true
+	}
+
+	return AttachmentPreview{}, false
 }
 
 // Focus gives focus to the component
@@ -351,4 +1042,239 @@ func (e *editor) Blur() tea.Cmd {
 func (e *editor) SetWorking(working bool) tea.Cmd {
 	e.working = working
 	return nil
+}
+
+// Value returns the current editor content
+func (e *editor) Value() string {
+	return e.textarea.Value()
+}
+
+// SetValue updates the editor content and moves cursor to end
+func (e *editor) SetValue(content string) {
+	e.textarea.SetValue(content)
+	e.textarea.MoveToEnd()
+	e.userTyped = content != ""
+	e.refreshSuggestion()
+}
+
+// InsertText inserts text at the current cursor position
+func (e *editor) InsertText(text string) {
+	e.textarea.InsertString(text)
+	e.userTyped = true
+	e.refreshSuggestion()
+}
+
+// AttachFile adds a file as an attachment and inserts @filepath into the editor
+func (e *editor) AttachFile(filePath string) {
+	placeholder := "@" + filePath
+	e.addFileAttachment(placeholder)
+	currentValue := e.textarea.Value()
+	e.textarea.SetValue(currentValue + placeholder + " ")
+	e.textarea.MoveToEnd()
+	e.userTyped = true
+	e.updateAttachmentBanner()
+}
+
+// tryAddFileRef checks if word is a valid @filepath and adds it as attachment.
+// Called when cursor leaves a word to detect manually-typed file references.
+func (e *editor) tryAddFileRef(word string) {
+	// Must start with @ and look like a path (contains / or .)
+	if !strings.HasPrefix(word, "@") || len(word) < 2 {
+		return
+	}
+
+	// Don't track paste placeholders as file refs
+	if strings.HasPrefix(word, "@paste-") {
+		return
+	}
+
+	path := word[1:] // strip @
+	if !strings.ContainsAny(path, "/.") {
+		return // not a path-like reference (e.g., @username)
+	}
+
+	e.addFileAttachment(word)
+}
+
+// addFileAttachment adds a file reference as an attachment if valid.
+func (e *editor) addFileAttachment(placeholder string) {
+	path := strings.TrimPrefix(placeholder, "@")
+
+	// Check if it's an existing file (not directory)
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return
+	}
+
+	// Avoid duplicates
+	for _, att := range e.attachments {
+		if att.placeholder == placeholder {
+			return
+		}
+	}
+
+	e.attachments = append(e.attachments, attachment{
+		path:        path,
+		placeholder: placeholder,
+		label:       fmt.Sprintf("%s (%s)", filepath.Base(path), units.HumanSize(float64(info.Size()))),
+		sizeBytes:   int(info.Size()),
+		isTemp:      false,
+	})
+}
+
+// collectAttachments returns a map of placeholder to file content for all attachments
+// referenced in content. Unreferenced attachments are cleaned up.
+func (e *editor) collectAttachments(content string) map[string]string {
+	if len(e.attachments) == 0 {
+		return nil
+	}
+
+	attachments := make(map[string]string)
+	for _, att := range e.attachments {
+		if !strings.Contains(content, att.placeholder) {
+			if att.isTemp {
+				_ = os.Remove(att.path)
+			}
+			continue
+		}
+
+		data, err := os.ReadFile(att.path)
+		if err != nil {
+			slog.Warn("failed to read attachment", "path", att.path, "error", err)
+			if att.isTemp {
+				_ = os.Remove(att.path)
+			}
+			continue
+		}
+
+		attachments[att.placeholder] = string(data)
+
+		if att.isTemp {
+			_ = os.Remove(att.path)
+		}
+	}
+	e.attachments = nil
+
+	return attachments
+}
+
+// Cleanup removes any temporary paste files that haven't been sent yet.
+func (e *editor) Cleanup() {
+	for _, att := range e.attachments {
+		if att.isTemp {
+			_ = os.Remove(att.path)
+		}
+	}
+	e.attachments = nil
+}
+
+// SetRecording sets the recording mode which shows animated dots as the cursor.
+// When recording is enabled, the placeholder changes to animated dots.
+func (e *editor) SetRecording(recording bool) tea.Cmd {
+	e.recording = recording
+	if recording {
+		e.recordingDotPhase = 0
+		e.textarea.Placeholder = "🎤 Listening"
+		return e.tickRecordingDots()
+	}
+	e.textarea.Placeholder = "Type your message here…"
+	return nil
+}
+
+// recordingDotsTickMsg is sent periodically to animate the recording dots
+type recordingDotsTickMsg struct{}
+
+// tickRecordingDots returns a command that ticks the recording dots animation
+func (e *editor) tickRecordingDots() tea.Cmd {
+	return tea.Tick(400*time.Millisecond, func(time.Time) tea.Msg {
+		return recordingDotsTickMsg{}
+	})
+}
+
+// IsRecording returns true if the editor is in recording mode
+func (e *editor) IsRecording() bool {
+	return e.recording
+}
+
+// SendContent triggers sending the current editor content
+func (e *editor) SendContent() tea.Cmd {
+	value := e.textarea.Value()
+	if value == "" {
+		return nil
+	}
+	return e.resetAndSend(value)
+}
+
+func (e *editor) handlePaste(content string) bool {
+	// Count lines (newlines + 1 for content without trailing newline)
+	lines := strings.Count(content, "\n") + 1
+	if strings.HasSuffix(content, "\n") {
+		lines-- // Don't count trailing newline as extra line
+	}
+
+	// Allow inline if within both limits
+	if lines <= maxInlinePasteLines && len(content) <= maxInlinePasteChars {
+		return false
+	}
+
+	e.pasteCounter++
+	att, err := createPasteAttachment(content, e.pasteCounter)
+	if err != nil {
+		slog.Warn("failed to buffer paste", "error", err)
+		// Still return true to prevent the large paste from falling through
+		// to textarea.Update(), which would block the UI for seconds.
+		return true
+	}
+
+	e.textarea.InsertString(att.placeholder)
+	e.attachments = append(e.attachments, att)
+
+	return true
+}
+
+func (e *editor) updateAttachmentBanner() {
+	if e.banner == nil {
+		return
+	}
+
+	value := e.textarea.Value()
+	var items []bannerItem
+
+	for _, att := range e.attachments {
+		if strings.Contains(value, att.placeholder) {
+			items = append(items, bannerItem{
+				label:       att.label,
+				placeholder: att.placeholder,
+			})
+		}
+	}
+
+	e.banner.SetItems(items)
+	e.updateTextareaHeight()
+}
+
+func createPasteAttachment(content string, num int) (attachment, error) {
+	pasteDir := filepath.Join(paths.GetDataDir(), "pastes")
+	if err := os.MkdirAll(pasteDir, 0o700); err != nil {
+		return attachment{}, fmt.Errorf("create paste dir: %w", err)
+	}
+
+	file, err := os.CreateTemp(pasteDir, "paste-*.txt")
+	if err != nil {
+		return attachment{}, fmt.Errorf("create paste file: %w", err)
+	}
+	defer file.Close()
+
+	if _, err := file.WriteString(content); err != nil {
+		return attachment{}, fmt.Errorf("write paste file: %w", err)
+	}
+
+	displayName := fmt.Sprintf("paste-%d", num)
+	return attachment{
+		path:        file.Name(),
+		placeholder: "@" + displayName,
+		label:       fmt.Sprintf("%s (%s)", displayName, units.HumanSize(float64(len(content)))),
+		sizeBytes:   len(content),
+		isTemp:      true,
+	}, nil
 }

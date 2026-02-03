@@ -1,286 +1,44 @@
 package teamloader
 
 import (
+	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
-	"os"
-	"path/filepath"
 	"strings"
-	"time"
+	"sync"
 
 	"github.com/docker/cagent/pkg/agent"
 	"github.com/docker/cagent/pkg/config"
-	latest "github.com/docker/cagent/pkg/config/v2"
-	"github.com/docker/cagent/pkg/environment"
-	"github.com/docker/cagent/pkg/gateway"
+	"github.com/docker/cagent/pkg/config/latest"
 	"github.com/docker/cagent/pkg/js"
-	"github.com/docker/cagent/pkg/memory/database/sqlite"
 	"github.com/docker/cagent/pkg/model/provider"
+	"github.com/docker/cagent/pkg/model/provider/dmr"
 	"github.com/docker/cagent/pkg/model/provider/options"
-	"github.com/docker/cagent/pkg/path"
+	"github.com/docker/cagent/pkg/modelsdev"
+	"github.com/docker/cagent/pkg/permissions"
+	"github.com/docker/cagent/pkg/rag"
 	"github.com/docker/cagent/pkg/team"
 	"github.com/docker/cagent/pkg/tools"
 	"github.com/docker/cagent/pkg/tools/builtin"
 	"github.com/docker/cagent/pkg/tools/codemode"
-	"github.com/docker/cagent/pkg/tools/mcp"
 )
 
-// ToolsetCreator is a function that creates a toolset based on the provided configuration
-type ToolsetCreator func(ctx context.Context, toolset latest.Toolset, parentDir string, envProvider environment.Provider, runtimeConfig config.RuntimeConfig) (tools.ToolSet, error)
+var defaultMaxTokens int64 = 32000
 
-// ToolsetRegistry manages the registration of toolset creators by type
-type ToolsetRegistry struct {
-	creators map[string]ToolsetCreator
-}
-
-// NewToolsetRegistry creates a new empty toolset registry
-func NewToolsetRegistry() *ToolsetRegistry {
-	return &ToolsetRegistry{
-		creators: make(map[string]ToolsetCreator),
+// isThinkingBudgetDisabled returns true if the thinking budget is explicitly set to disable thinking
+// (e.g., thinking_budget: 0 or thinking_budget: none).
+func isThinkingBudgetDisabled(tb *latest.ThinkingBudget) bool {
+	if tb == nil {
+		return false
 	}
-}
-
-// Register adds a new toolset creator for the given type
-func (r *ToolsetRegistry) Register(toolsetType string, creator ToolsetCreator) {
-	r.creators[toolsetType] = creator
-}
-
-// Get retrieves a toolset creator for the given type
-func (r *ToolsetRegistry) Get(toolsetType string) (ToolsetCreator, bool) {
-	creator, ok := r.creators[toolsetType]
-	return creator, ok
-}
-
-// CreateTool creates a toolset using the registered creator for the given type
-func (r *ToolsetRegistry) CreateTool(ctx context.Context, toolset latest.Toolset, parentDir string, envProvider environment.Provider, runtimeConfig config.RuntimeConfig) (tools.ToolSet, error) {
-	creator, ok := r.Get(toolset.Type)
-	if !ok {
-		return nil, fmt.Errorf("unknown toolset type: %s", toolset.Type)
+	// Disabled if tokens is explicitly 0
+	if tb.Tokens == 0 && tb.Effort == "" {
+		return true
 	}
-	return creator(ctx, toolset, parentDir, envProvider, runtimeConfig)
-}
-
-func NewDefaultToolsetRegistry() *ToolsetRegistry {
-	r := NewToolsetRegistry()
-	// Register all built-in toolset creators
-	r.Register("todo", createTodoTool)
-	r.Register("memory", createMemoryTool)
-	r.Register("think", createThinkTool)
-	r.Register("shell", createShellTool)
-	r.Register("script", createScriptTool)
-	r.Register("filesystem", createFilesystemTool)
-	r.Register("fetch", createFetchTool)
-	r.Register("mcp", createMCPTool)
-	r.Register("api", createAPITool)
-	return r
-}
-
-func createTodoTool(ctx context.Context, toolset latest.Toolset, parentDir string, envProvider environment.Provider, runtimeConfig config.RuntimeConfig) (tools.ToolSet, error) {
-	if toolset.Shared {
-		return builtin.NewSharedTodoTool(), nil
-	}
-	return builtin.NewTodoTool(), nil
-}
-
-func createMemoryTool(ctx context.Context, toolset latest.Toolset, parentDir string, envProvider environment.Provider, runtimeConfig config.RuntimeConfig) (tools.ToolSet, error) {
-	var memoryPath string
-	if filepath.IsAbs(toolset.Path) {
-		memoryPath = ""
-	} else if wd, err := os.Getwd(); err == nil {
-		memoryPath = wd
-	} else {
-		memoryPath = parentDir
-	}
-
-	validatedMemoryPath, err := path.ValidatePathInDirectory(toolset.Path, memoryPath)
-	if err != nil {
-		return nil, fmt.Errorf("invalid memory database path: %w", err)
-	}
-	if err := os.MkdirAll(filepath.Dir(validatedMemoryPath), 0o700); err != nil {
-		return nil, fmt.Errorf("failed to create memory database directory: %w", err)
-	}
-
-	db, err := sqlite.NewMemoryDatabase(validatedMemoryPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create memory database: %w", err)
-	}
-
-	return builtin.NewMemoryTool(db), nil
-}
-
-func createThinkTool(ctx context.Context, toolset latest.Toolset, parentDir string, envProvider environment.Provider, runtimeConfig config.RuntimeConfig) (tools.ToolSet, error) {
-	return builtin.NewThinkTool(), nil
-}
-
-func createShellTool(ctx context.Context, toolset latest.Toolset, parentDir string, envProvider environment.Provider, runtimeConfig config.RuntimeConfig) (tools.ToolSet, error) {
-	env, err := environment.ExpandAll(ctx, environment.ToValues(toolset.Env), envProvider)
-	if err != nil {
-		return nil, fmt.Errorf("failed to expand the tool's environment variables: %w", err)
-	}
-	env = append(env, os.Environ()...)
-	return builtin.NewShellTool(env), nil
-}
-
-func createScriptTool(ctx context.Context, toolset latest.Toolset, parentDir string, envProvider environment.Provider, runtimeConfig config.RuntimeConfig) (tools.ToolSet, error) {
-	if len(toolset.Shell) == 0 {
-		return nil, fmt.Errorf("shell is required for script toolset")
-	}
-
-	env, err := environment.ExpandAll(ctx, environment.ToValues(toolset.Env), envProvider)
-	if err != nil {
-		return nil, fmt.Errorf("failed to expand the tool's environment variables: %w", err)
-	}
-	env = append(env, os.Environ()...)
-	return builtin.NewScriptShellTool(toolset.Shell, env), nil
-}
-
-func createFilesystemTool(ctx context.Context, toolset latest.Toolset, parentDir string, envProvider environment.Provider, runtimeConfig config.RuntimeConfig) (tools.ToolSet, error) {
-	wd := runtimeConfig.WorkingDir
-	if wd == "" {
-		var err error
-		wd, err = os.Getwd()
-		if err != nil {
-			return nil, fmt.Errorf("failed to get working directory: %w", err)
-		}
-	}
-
-	var opts []builtin.FileSystemOpt
-
-	// Handle ignore_vcs configuration (default to true)
-	ignoreVCS := true
-	if toolset.IgnoreVCS != nil {
-		ignoreVCS = *toolset.IgnoreVCS
-	}
-	opts = append(opts, builtin.WithIgnoreVCS(ignoreVCS))
-
-	// Handle post-edit commands
-	if len(toolset.PostEdit) > 0 {
-		postEditConfigs := make([]builtin.PostEditConfig, len(toolset.PostEdit))
-		for i, pe := range toolset.PostEdit {
-			postEditConfigs[i] = builtin.PostEditConfig{
-				Path: pe.Path,
-				Cmd:  pe.Cmd,
-			}
-		}
-		opts = append(opts, builtin.WithPostEditCommands(postEditConfigs))
-	}
-
-	return builtin.NewFilesystemTool([]string{wd}, opts...), nil
-}
-
-func createAPITool(ctx context.Context, toolset latest.Toolset, parentDir string, envProvider environment.Provider, runtimeConfig config.RuntimeConfig) (tools.ToolSet, error) {
-	if toolset.APIConfig.Endpoint == "" {
-		return nil, fmt.Errorf("api tool requires an endpoint in api_config")
-	}
-
-	toolset.APIConfig.Headers = js.Expand(ctx, toolset.APIConfig.Headers, envProvider)
-
-	return builtin.NewAPITool(toolset.APIConfig), nil
-}
-
-func createFetchTool(ctx context.Context, toolset latest.Toolset, parentDir string, envProvider environment.Provider, runtimeConfig config.RuntimeConfig) (tools.ToolSet, error) {
-	var opts []builtin.FetchToolOption
-	if toolset.Timeout > 0 {
-		timeout := time.Duration(toolset.Timeout) * time.Second
-		opts = append(opts, builtin.WithTimeout(timeout))
-	}
-	return builtin.NewFetchTool(opts...), nil
-}
-
-func createMCPTool(ctx context.Context, toolset latest.Toolset, parentDir string, envProvider environment.Provider, runtimeConfig config.RuntimeConfig) (tools.ToolSet, error) {
-	// MCP tool has three different modes: ref, command, and remote
-	if toolset.Ref != "" {
-		mcpServerName := gateway.ParseServerRef(toolset.Ref)
-		serverSpec, err := gateway.ServerSpec(ctx, mcpServerName)
-		if err != nil {
-			return nil, fmt.Errorf("fetching MCP server spec for %q: %w", mcpServerName, err)
-		}
-
-		// TODO(dga): until the MCP Gateway supports oauth with cagent, we fetch the remote url and directly connect to it.
-		if serverSpec.Type == "remote" {
-			return mcp.NewRemoteToolset(serverSpec.Remote.URL, serverSpec.Remote.TransportType, nil, runtimeConfig.RedirectURI), nil
-		}
-
-		return mcp.NewGatewayToolset(ctx, mcpServerName, toolset.Config, envProvider)
-	}
-
-	if toolset.Command != "" {
-		env, err := environment.ExpandAll(ctx, environment.ToValues(toolset.Env), envProvider)
-		if err != nil {
-			return nil, fmt.Errorf("failed to expand the tool's environment variables: %w", err)
-		}
-		env = append(env, os.Environ()...)
-		return mcp.NewToolsetCommand(toolset.Command, toolset.Args, env), nil
-	}
-
-	if toolset.Remote.URL != "" {
-		headers := map[string]string{}
-		for k, v := range toolset.Remote.Headers {
-			expanded, err := environment.Expand(ctx, v, envProvider)
-			if err != nil {
-				return nil, fmt.Errorf("failed to expand header '%s': %w", k, err)
-			}
-
-			headers[k] = expanded
-		}
-
-		return mcp.NewRemoteToolset(toolset.Remote.URL, toolset.Remote.TransportType, headers, runtimeConfig.RedirectURI), nil
-	}
-
-	return nil, fmt.Errorf("mcp toolset requires either ref, command, or remote configuration")
-}
-
-// LoadTeams loads all agent teams from the given directory or file path
-func LoadTeams(ctx context.Context, agentsPathOrDirectory string, runtimeConfig config.RuntimeConfig) (map[string]*team.Team, error) {
-	teams := make(map[string]*team.Team)
-
-	agentPaths, err := findAgentPaths(agentsPathOrDirectory)
-	if err != nil {
-		return nil, fmt.Errorf("failed to find agents: %w", err)
-	}
-
-	for _, agentPath := range agentPaths {
-		t, err := Load(ctx, agentPath, runtimeConfig)
-		if err != nil {
-			slog.Warn("Failed to load agent", "file", agentPath, "error", err)
-			continue
-		}
-
-		teams[t.ID] = t
-	}
-
-	return teams, nil
-}
-
-// findAgentPaths finds all agent YAML files in the given directory or returns the single file path
-func findAgentPaths(agentsPathOrDirectory string) ([]string, error) {
-	stat, err := os.Stat(agentsPathOrDirectory)
-	if err != nil {
-		return nil, fmt.Errorf("failed to stat agents path: %w", err)
-	}
-
-	if !stat.IsDir() {
-		return []string{agentsPathOrDirectory}, nil
-	}
-
-	var agents []string
-
-	agentsDirectory := agentsPathOrDirectory
-	entries, err := os.ReadDir(agentsDirectory)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read directory: %w", err)
-	}
-
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".yaml") {
-			continue
-		}
-
-		agents = append(agents, filepath.Join(agentsDirectory, entry.Name()))
-	}
-
-	return agents, nil
+	// Disabled if effort is "none"
+	return tb.Effort == "none"
 }
 
 type loadOptions struct {
@@ -305,7 +63,28 @@ func WithToolsetRegistry(registry *ToolsetRegistry) Opt {
 	}
 }
 
-func Load(ctx context.Context, p string, runtimeConfig config.RuntimeConfig, opts ...Opt) (*team.Team, error) {
+// LoadResult contains the result of loading an agent team, including
+// the team and configuration needed for runtime model switching.
+type LoadResult struct {
+	Team      *team.Team
+	Models    map[string]latest.ModelConfig
+	Providers map[string]latest.ProviderConfig
+	// AgentDefaultModels maps agent names to their configured default model references
+	AgentDefaultModels map[string]string
+}
+
+// Load loads an agent team from the given source
+func Load(ctx context.Context, agentSource config.Source, runConfig *config.RuntimeConfig, opts ...Opt) (*team.Team, error) {
+	result, err := LoadWithConfig(ctx, agentSource, runConfig, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return result.Team, nil
+}
+
+// LoadWithConfig loads an agent team and returns both the team and config info
+// needed for runtime model switching.
+func LoadWithConfig(ctx context.Context, agentSource config.Source, runConfig *config.RuntimeConfig, opts ...Opt) (*LoadResult, error) {
 	var loadOpts loadOptions
 	loadOpts.toolsetRegistry = NewDefaultToolsetRegistry()
 
@@ -315,32 +94,15 @@ func Load(ctx context.Context, p string, runtimeConfig config.RuntimeConfig, opt
 		}
 	}
 
-	fileName := filepath.Base(p)
-	parentDir := filepath.Dir(p)
-
-	// Make env file paths absolute relative to the agent config file.
-	var err error
-	runtimeConfig.EnvFiles, err = environment.AbsolutePaths(parentDir, runtimeConfig.EnvFiles)
-	if err != nil {
-		return nil, err
-	}
-
-	envFilesProviders, err := environment.NewEnvFilesProvider(runtimeConfig.EnvFiles)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read env files: %w", err)
-	}
-
-	defaultEnvProvider := runtimeConfig.DefaultEnvProvider
-	if defaultEnvProvider == nil {
-		defaultEnvProvider = environment.NewDefaultProvider()
-	}
-	env := environment.NewMultiProvider(envFilesProviders, defaultEnvProvider)
-
 	// Load the agent's configuration
-	cfg, err := config.LoadConfigSecureDeprecated(fileName, parentDir)
+	cfg, err := config.Load(ctx, agentSource)
 	if err != nil {
 		return nil, err
 	}
+
+	// Resolve model aliases (e.g., "claude-sonnet-4-5" -> "claude-sonnet-4-5-20250929")
+	// This ensures the sidebar and other UI elements show the actual model being used.
+	config.ResolveModelAliases(ctx, cfg)
 
 	// Apply model overrides from CLI flags before checking required env vars
 	if err := config.ApplyModelOverrides(cfg, loadOpts.modelOverrides); err != nil {
@@ -348,58 +110,90 @@ func Load(ctx context.Context, p string, runtimeConfig config.RuntimeConfig, opt
 	}
 
 	// Early check for required env vars before loading models and tools.
-	if err := config.CheckRequiredEnvVars(ctx, cfg, env, runtimeConfig); err != nil {
+	env := runConfig.EnvProvider()
+	if err := config.CheckRequiredEnvVars(ctx, cfg, runConfig.ModelsGateway, env); err != nil {
 		return nil, err
+	}
+
+	// Create RAG managers
+	parentDir := cmp.Or(agentSource.ParentDir(), runConfig.WorkingDir)
+	ragManagers, err := rag.NewManagers(ctx, cfg, rag.ManagersBuildConfig{
+		ParentDir:     parentDir,
+		ModelsGateway: runConfig.ModelsGateway,
+		Env:           env,
+		Models:        cfg.Models,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create RAG managers: %w", err)
 	}
 
 	// Load agents
 	var agents []*agent.Agent
 	agentsByName := make(map[string]*agent.Agent)
 
-	for name, agentConfig := range cfg.Agents {
+	autoModel := sync.OnceValue(func() latest.ModelConfig {
+		return config.AutoModelConfig(ctx, runConfig.ModelsGateway, env)
+	})
+
+	expander := js.NewJsExpander(env)
+
+	for _, agentConfig := range cfg.Agents {
+		skillsEnabled := false
+		if agentConfig.Skills != nil {
+			skillsEnabled = *agentConfig.Skills
+		}
+
 		opts := []agent.Opt{
-			agent.WithName(name),
-			agent.WithDescription(agentConfig.Description),
-			agent.WithWelcomeMessage(agentConfig.WelcomeMessage),
+			agent.WithName(agentConfig.Name),
+			agent.WithDescription(expander.Expand(ctx, agentConfig.Description)),
+			agent.WithWelcomeMessage(expander.Expand(ctx, agentConfig.WelcomeMessage)),
 			agent.WithAddDate(agentConfig.AddDate),
 			agent.WithAddEnvironmentInfo(agentConfig.AddEnvironmentInfo),
+			agent.WithAddDescriptionParameter(agentConfig.AddDescriptionParameter),
 			agent.WithAddPromptFiles(agentConfig.AddPromptFiles),
 			agent.WithMaxIterations(agentConfig.MaxIterations),
 			agent.WithNumHistoryItems(agentConfig.NumHistoryItems),
-			agent.WithCommands(js.Expand(ctx, agentConfig.Commands, env)),
+			agent.WithCommands(expander.ExpandCommands(ctx, agentConfig.Commands)),
+			agent.WithSkillsEnabled(skillsEnabled),
+			agent.WithHooks(agentConfig.Hooks),
 		}
 
-		models, err := getModelsForAgent(ctx, cfg, &agentConfig, env, runtimeConfig)
+		models, thinkingConfigured, err := getModelsForAgent(ctx, cfg, &agentConfig, autoModel, runConfig)
 		if err != nil {
+			// Return auto model fallback errors and DMR not installed errors directly
+			// without wrapping to provide cleaner messages
+			var autoErr *config.ErrAutoModelFallback
+			if errors.As(err, &autoErr) || errors.Is(err, dmr.ErrNotInstalled) {
+				return nil, err
+			}
 			return nil, fmt.Errorf("failed to get models: %w", err)
 		}
 		for _, model := range models {
 			opts = append(opts, agent.WithModel(model))
 		}
+		opts = append(opts, agent.WithThinkingConfigured(thinkingConfigured))
 
-		agentTools, warnings := getToolsForAgent(ctx, &agentConfig, parentDir, env, runtimeConfig, loadOpts.toolsetRegistry)
+		agentTools, warnings := getToolsForAgent(ctx, &agentConfig, parentDir, runConfig, loadOpts.toolsetRegistry)
 		if len(warnings) > 0 {
 			opts = append(opts, agent.WithLoadTimeWarnings(warnings))
 		}
 
-		if len(agentConfig.SubAgents) > 0 {
-			agentTools = append(agentTools, builtin.NewTransferTaskTool())
+		// Add RAG tools if agent has RAG sources
+		if len(agentConfig.RAG) > 0 {
+			ragTools := createRAGToolsForAgent(&agentConfig, ragManagers)
+			agentTools = append(agentTools, ragTools...)
 		}
 
-		if len(agentTools) > 0 {
-			opts = append(opts, agent.WithToolSets(agentTools...))
-		}
+		opts = append(opts, agent.WithToolSets(agentTools...))
 
-		ag := agent.New(name, agentConfig.Instruction, opts...)
+		ag := agent.New(agentConfig.Name, agentConfig.Instruction, opts...)
 		agents = append(agents, ag)
-		agentsByName[name] = ag
+		agentsByName[agentConfig.Name] = ag
 	}
 
-	for name := range cfg.Agents {
-		agentConfig := cfg.Agents[name]
-		if len(agentConfig.SubAgents) == 0 {
-			continue
-		}
+	// Connect sub-agents and handoff agents
+	for _, agentConfig := range cfg.Agents {
+		name := agentConfig.Name
 
 		subAgents := make([]*agent.Agent, 0, len(agentConfig.SubAgents))
 		for _, subName := range agentConfig.SubAgents {
@@ -411,47 +205,123 @@ func Load(ctx context.Context, p string, runtimeConfig config.RuntimeConfig, opt
 		if a, exists := agentsByName[name]; exists && len(subAgents) > 0 {
 			agent.WithSubAgents(subAgents...)(a)
 		}
+
+		handoffs := make([]*agent.Agent, 0, len(agentConfig.Handoffs))
+		for _, handoffName := range agentConfig.Handoffs {
+			if handoffAgent, exists := agentsByName[handoffName]; exists {
+				handoffs = append(handoffs, handoffAgent)
+			}
+		}
+
+		if a, exists := agentsByName[name]; exists && len(handoffs) > 0 {
+			agent.WithHandoffs(handoffs...)(a)
+		}
 	}
 
-	return team.New(team.WithID(fileName), team.WithAgents(agents...)), nil
+	// Create permissions checker from config
+	permChecker := permissions.NewChecker(cfg.Permissions)
+
+	// Build agent default models map
+	agentDefaultModels := make(map[string]string)
+	for _, agent := range cfg.Agents {
+		if agent.Model != "" {
+			agentDefaultModels[agent.Name] = agent.Model
+		}
+	}
+
+	return &LoadResult{
+		Team: team.New(
+			team.WithAgents(agents...),
+			team.WithRAGManagers(ragManagers),
+			team.WithPermissions(permChecker),
+		),
+		Models:             cfg.Models,
+		Providers:          cfg.Providers,
+		AgentDefaultModels: agentDefaultModels,
+	}, nil
 }
 
-func getModelsForAgent(ctx context.Context, cfg *latest.Config, a *latest.AgentConfig, env environment.Provider, runtimeConfig config.RuntimeConfig) ([]provider.Provider, error) {
+func getModelsForAgent(ctx context.Context, cfg *latest.Config, a *latest.AgentConfig, autoModelFn func() latest.ModelConfig, runConfig *config.RuntimeConfig) ([]provider.Provider, bool, error) {
 	var models []provider.Provider
+	thinkingConfigured := false
 
 	for name := range strings.SplitSeq(a.Model, ",") {
 		modelCfg, exists := cfg.Models[name]
+		isAutoModel := false
 		if !exists {
-			return nil, fmt.Errorf("model '%s' not found in configuration", name)
+			if name == "auto" {
+				modelCfg = autoModelFn()
+				isAutoModel = true
+			} else {
+				return nil, false, fmt.Errorf("model '%s' not found in configuration", name)
+			}
 		}
 
-		opts := []options.Opt{options.WithGateway(runtimeConfig.ModelsGateway)}
-		if a.StructuredOutput != nil {
-			opts = append(opts, options.WithStructuredOutput(a.StructuredOutput))
+		// Check if thinking_budget was explicitly configured BEFORE provider defaults are applied.
+		// This is used to initialize session thinking state - thinking is only enabled by default
+		// when the user explicitly configured it in their YAML.
+		if modelCfg.ThinkingBudget != nil && !isThinkingBudgetDisabled(modelCfg.ThinkingBudget) {
+			thinkingConfigured = true
 		}
 
-		model, err := provider.New(ctx, &modelCfg, env, opts...)
+		opts := []options.Opt{
+			options.WithGateway(runConfig.ModelsGateway),
+			options.WithStructuredOutput(a.StructuredOutput),
+			options.WithProviders(cfg.Providers),
+		}
+
+		// Use max_tokens from config if specified, otherwise look up from models.dev
+		var maxTokens *int64
+		if modelCfg.MaxTokens != nil {
+			maxTokens = modelCfg.MaxTokens
+		} else {
+			maxTokens = &defaultMaxTokens
+			modelsStore, err := modelsdev.NewStore()
+			if err != nil {
+				return nil, false, err
+			}
+			m, err := modelsStore.GetModel(ctx, modelCfg.Provider+"/"+modelCfg.Model)
+			if err == nil {
+				maxTokens = &m.Limit.Output
+			}
+		}
+		if maxTokens != nil {
+			opts = append(opts, options.WithMaxTokens(*maxTokens))
+		}
+
+		// Pass the full models map for routing rules to resolve model references
+		model, err := provider.NewWithModels(ctx,
+			&modelCfg,
+			cfg.Models,
+			runConfig.EnvProvider(),
+			opts...,
+		)
 		if err != nil {
-			return nil, err
+			// Return a cleaner error message for auto model selection failures
+			if isAutoModel {
+				return nil, false, &config.ErrAutoModelFallback{}
+			}
+			return nil, false, err
 		}
-
 		models = append(models, model)
 	}
 
-	return models, nil
+	return models, thinkingConfigured, nil
 }
 
 // getToolsForAgent returns the tool definitions for an agent based on its configuration
-func getToolsForAgent(ctx context.Context, a *latest.AgentConfig, parentDir string, envProvider environment.Provider, runtimeConfig config.RuntimeConfig, registry *ToolsetRegistry) ([]tools.ToolSet, []string) {
+func getToolsForAgent(ctx context.Context, a *latest.AgentConfig, parentDir string, runConfig *config.RuntimeConfig, registry *ToolsetRegistry) ([]tools.ToolSet, []string) {
 	var (
 		toolSets []tools.ToolSet
 		warnings []string
 	)
 
+	deferredToolset := builtin.NewDeferredToolset()
+
 	for i := range a.Toolsets {
 		toolset := a.Toolsets[i]
 
-		tool, err := registry.CreateTool(ctx, toolset, parentDir, envProvider, runtimeConfig)
+		tool, err := registry.CreateTool(ctx, toolset, parentDir, runConfig)
 		if err != nil {
 			// Collect error but continue loading other toolsets
 			slog.Warn("Toolset configuration failed; skipping", "type", toolset.Type, "ref", toolset.Ref, "command", toolset.Command, "error", err)
@@ -463,15 +333,72 @@ func getToolsForAgent(ctx context.Context, a *latest.AgentConfig, parentDir stri
 		wrapped = WithInstructions(wrapped, toolset.Instruction)
 		wrapped = WithToon(wrapped, toolset.Toon)
 
+		// Handle deferred tools
+		if !toolset.Defer.IsEmpty() {
+			deferredToolset.AddSource(wrapped, toolset.Defer.DeferAll, toolset.Defer.Tools)
+			if toolset.Defer.DeferAll {
+				// Don't add the wrapped toolset to toolSets - all its tools are deferred
+				// TODO: maybe we _do_ want to add this toolset since it has instructions?
+				continue
+			} else {
+				wrapped = WithToolsExcludeFilter(wrapped, toolset.Defer.Tools...)
+			}
+		}
+
 		toolSets = append(toolSets, wrapped)
+	}
+
+	if deferredToolset.HasSources() {
+		toolSets = append(toolSets, deferredToolset)
+	}
+
+	if len(a.SubAgents) > 0 {
+		toolSets = append(toolSets, builtin.NewTransferTaskTool())
+	}
+	if len(a.Handoffs) > 0 {
+		toolSets = append(toolSets, builtin.NewHandoffTool())
 	}
 
 	// Wrap all tools in a single Code Mode toolset.
 	// This allows the agent to call multiple tools in a single response.
 	// It also allows to combine the results of multiple tools in a single response.
-	if a.CodeModeTools || runtimeConfig.GlobalCodeMode {
+	if a.CodeModeTools || runConfig.GlobalCodeMode {
 		toolSets = []tools.ToolSet{codemode.Wrap(toolSets...)}
 	}
 
 	return toolSets, warnings
+}
+
+// createRAGToolsForAgent creates RAG tools for an agent, one for each referenced RAG source
+func createRAGToolsForAgent(agentConfig *latest.AgentConfig, allManagers map[string]*rag.Manager) []tools.ToolSet {
+	if len(agentConfig.RAG) == 0 {
+		return nil
+	}
+
+	var ragTools []tools.ToolSet
+
+	for _, ragName := range agentConfig.RAG {
+		mgr, exists := allManagers[ragName]
+		if !exists {
+			slog.Error("RAG source not found", "rag_source", ragName)
+			continue
+		}
+
+		// Use custom tool name if configured, otherwise use the RAG source name
+		toolName := cmp.Or(mgr.ToolName(), ragName)
+
+		// Create a separate tool for this RAG source
+		ragTool := builtin.NewRAGTool(mgr, toolName)
+
+		ragTools = append(ragTools, ragTool)
+
+		slog.Debug("Created RAG tool for agent",
+			"rag_source", ragName,
+			"tool_name", toolName,
+			"manager_name", mgr.Name(),
+			"description", mgr.Description(),
+			"instruction", mgr.ToolInstruction())
+	}
+
+	return ragTools
 }

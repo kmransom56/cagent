@@ -1,8 +1,6 @@
 package dialog
 
 import (
-	"strings"
-
 	"charm.land/bubbles/v2/key"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
@@ -16,9 +14,18 @@ import (
 	"github.com/docker/cagent/pkg/tui/types"
 )
 
+// Layout constants for tool confirmation dialog.
+const (
+	toolConfirmDialogWidthPercent  = 70 // Dialog width as percentage of screen
+	toolConfirmDialogHeightPercent = 80 // Max dialog height as percentage of screen
+	toolConfirmMinScrollHeight     = 5  // Minimum height for the scroll view
+	toolConfirmEmptyLinesBefore    = 2  // Empty lines before question
+	toolConfirmEmptyLinesAfter     = 1  // Empty lines after question
+)
+
 type (
 	RuntimeResumeMsg struct {
-		Response runtime.ResumeType
+		Request runtime.ResumeRequest
 	}
 )
 
@@ -28,46 +35,54 @@ type ToolConfirmationResponse struct {
 }
 
 type toolConfirmationDialog struct {
-	width, height int
-	msg           *runtime.ToolCallConfirmationEvent
-	keyMap        toolConfirmationKeyMap
-	sessionState  *service.SessionState
-	scrollView    messages.Model
+	BaseDialog
+	msg          *runtime.ToolCallConfirmationEvent
+	keyMap       toolConfirmationKeyMap
+	sessionState *service.SessionState
+	scrollView   messages.Model
+}
+
+// dialogDimensions returns computed dialog width and content width.
+func (d *toolConfirmationDialog) dialogDimensions() (dialogWidth, contentWidth int) {
+	dialogWidth = d.Width() * toolConfirmDialogWidthPercent / 100
+	contentWidth = dialogWidth - styles.DialogStyle.GetHorizontalFrameSize()
+	return dialogWidth, contentWidth
 }
 
 // SetSize implements [Dialog].
 func (d *toolConfirmationDialog) SetSize(width, height int) tea.Cmd {
-	d.width = width
-	d.height = height
+	d.BaseDialog.SetSize(width, height)
 
-	// Calculate dialog dimensions
-	dialogWidth := width * 70 / 100
-	contentWidth := dialogWidth - 6
-	maxDialogHeight := (height * 80) / 100
+	// Calculate dialog dimensions using helper
+	_, contentWidth := d.dialogDimensions()
+	maxDialogHeight := height * toolConfirmDialogHeightPercent / 100
 
+	// Measure fixed UI elements using the same rendering as View()
 	titleStyle := styles.DialogTitleStyle.Width(contentWidth)
 	title := titleStyle.Render("Tool Confirmation")
 	titleHeight := lipgloss.Height(title)
 
-	separatorWidth := max(contentWidth-10, 20)
-	separator := styles.DialogSeparatorStyle.
-		Align(lipgloss.Center).
-		Width(contentWidth).
-		Render(strings.Repeat("─", separatorWidth))
+	separator := d.renderSeparator(contentWidth)
 	separatorHeight := lipgloss.Height(separator)
 
 	question := styles.DialogQuestionStyle.Width(contentWidth).Render("Do you want to allow this tool call?")
 	questionHeight := lipgloss.Height(question)
 
-	options := styles.DialogOptionsStyle.Width(contentWidth).Render("[Y]es    [N]o    [A]ll (approve all tools this session)")
+	options := RenderHelpKeys(contentWidth, "Y", "yes", "N", "no", "A", "all (approve all tools this session)")
 	optionsHeight := lipgloss.Height(options)
 
 	// Calculate available height for scroll view
-	// Total = maxDialogHeight - title - separator - 2 empty lines - question - empty line - options - 4 (dialog padding/border)
-	availableHeight := max(maxDialogHeight-titleHeight-separatorHeight-2-questionHeight-1-optionsHeight-4, 5)
+	frameHeight := styles.DialogStyle.GetVerticalFrameSize()
+	fixedContentHeight := titleHeight + separatorHeight + toolConfirmEmptyLinesBefore + questionHeight + toolConfirmEmptyLinesAfter + optionsHeight
+	availableHeight := max(maxDialogHeight-frameHeight-fixedContentHeight, toolConfirmMinScrollHeight)
 	d.scrollView.SetSize(contentWidth, availableHeight)
 
 	return nil
+}
+
+// renderSeparator renders the separator line consistently.
+func (d *toolConfirmationDialog) renderSeparator(contentWidth int) string {
+	return RenderSeparator(contentWidth)
 }
 
 // toolConfirmationKeyMap defines key bindings for tool confirmation dialog
@@ -97,8 +112,8 @@ func defaultToolConfirmationKeyMap() toolConfirmationKeyMap {
 
 // NewToolConfirmationDialog creates a new tool confirmation dialog
 func NewToolConfirmationDialog(msg *runtime.ToolCallConfirmationEvent, sessionState *service.SessionState) Dialog {
-	// Create scrollable view with initial size (will be updated in SetSize)
-	scrollView := messages.NewScrollableView(100, 20, sessionState)
+	// Create scrollable view with minimal initial size (will be updated in SetSize)
+	scrollView := messages.NewScrollableView(1, 1, sessionState)
 
 	// Add the tool call message to the view
 	scrollView.AddOrUpdateToolCall(
@@ -125,28 +140,35 @@ func (d *toolConfirmationDialog) Init() tea.Cmd {
 func (d *toolConfirmationDialog) Update(msg tea.Msg) (layout.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		d.width = msg.Width
-		d.height = msg.Height
 		cmd := d.SetSize(msg.Width, msg.Height)
 		return d, cmd
 
 	case tea.KeyPressMsg:
-		switch {
-		case key.Matches(msg, d.keyMap.Yes):
-			return d, tea.Sequence(core.CmdHandler(CloseDialogMsg{}), core.CmdHandler(RuntimeResumeMsg{Response: runtime.ResumeTypeApprove}))
-		case key.Matches(msg, d.keyMap.No):
-			return d, tea.Sequence(core.CmdHandler(CloseDialogMsg{}), core.CmdHandler(RuntimeResumeMsg{Response: runtime.ResumeTypeReject}))
-		case key.Matches(msg, d.keyMap.All):
-			return d, tea.Sequence(core.CmdHandler(CloseDialogMsg{}), core.CmdHandler(RuntimeResumeMsg{Response: runtime.ResumeTypeApproveSession}))
+		if cmd := HandleQuit(msg); cmd != nil {
+			return d, cmd
 		}
 
-		if msg.String() == "ctrl+c" {
-			return d, tea.Quit
+		switch {
+		case key.Matches(msg, d.keyMap.Yes):
+			return d, tea.Sequence(
+				core.CmdHandler(CloseDialogMsg{}),
+				core.CmdHandler(RuntimeResumeMsg{Request: runtime.ResumeApprove()}),
+			)
+		case key.Matches(msg, d.keyMap.No):
+			// Open the rejection reason dialog on top of this dialog
+			return d, core.CmdHandler(OpenDialogMsg{
+				Model: NewToolRejectionReasonDialog(),
+			})
+		case key.Matches(msg, d.keyMap.All):
+			d.sessionState.SetYoloMode(true)
+			return d, tea.Sequence(
+				core.CmdHandler(CloseDialogMsg{}),
+				core.CmdHandler(RuntimeResumeMsg{Request: runtime.ResumeApproveSession()}),
+			)
 		}
 
 		// Forward scrolling keys to the scroll view
-		switch msg.String() {
-		case "up", "k", "down", "j", "pgup", "pgdown", "home", "end":
+		if _, isScrollKey := core.GetScrollDirection(msg); isScrollKey {
 			updatedScrollView, cmd := d.scrollView.Update(msg)
 			d.scrollView = updatedScrollView.(messages.Model)
 			return d, cmd
@@ -164,29 +186,18 @@ func (d *toolConfirmationDialog) Update(msg tea.Msg) (layout.Model, tea.Cmd) {
 
 // View renders the tool confirmation dialog
 func (d *toolConfirmationDialog) View() string {
-	dialogWidth := d.width * 70 / 100
-
-	// Content width (accounting for padding and borders)
-	contentWidth := dialogWidth - 6
+	dialogWidth, contentWidth := d.dialogDimensions()
 
 	dialogStyle := styles.DialogStyle.Width(dialogWidth)
 
-	// Title
 	titleStyle := styles.DialogTitleStyle.Width(contentWidth)
 	title := titleStyle.Render("Tool Confirmation")
 
 	// Separator
-	separatorWidth := max(contentWidth-10, 20)
-	separator := styles.DialogSeparatorStyle.
-		Align(lipgloss.Center).
-		Width(contentWidth).
-		Render(strings.Repeat("─", separatorWidth))
+	separator := d.renderSeparator(contentWidth)
 
 	// Get scrollable tool call view
 	argumentsSection := d.scrollView.View()
-
-	question := styles.DialogQuestionStyle.Width(contentWidth).Render("Do you want to allow this tool call?")
-	options := styles.DialogOptionsStyle.Width(contentWidth).Render("[Y]es    [N]o    [A]ll (approve all tools this session)")
 
 	// Combine all parts with proper spacing
 	parts := []string{title, separator}
@@ -194,6 +205,10 @@ func (d *toolConfirmationDialog) View() string {
 	if argumentsSection != "" {
 		parts = append(parts, "", argumentsSection)
 	}
+
+	// Confirmation prompt
+	question := styles.DialogQuestionStyle.Width(contentWidth).Render("Do you want to allow this tool call?")
+	options := RenderHelpKeys(contentWidth, "Y", "yes", "N", "no", "A", "all (approve all tools this session)")
 
 	parts = append(parts, "", question, "", options)
 
@@ -204,14 +219,8 @@ func (d *toolConfirmationDialog) View() string {
 
 // Position calculates the position to center the dialog
 func (d *toolConfirmationDialog) Position() (row, col int) {
-	dialogWidth := d.width * 70 / 100
-
-	// Calculate actual dialog height by rendering it
+	dialogWidth, _ := d.dialogDimensions()
 	renderedDialog := d.View()
 	dialogHeight := lipgloss.Height(renderedDialog)
-
-	// Ensure dialog stays on screen
-	row = max(0, (d.height-dialogHeight)/2)
-	col = max(0, (d.width-dialogWidth)/2)
-	return row, col
+	return CenterPosition(d.Width(), d.Height(), dialogWidth, dialogHeight)
 }

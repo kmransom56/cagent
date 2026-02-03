@@ -15,7 +15,7 @@ agents with specialized capabilities and tools. It features:
 - **📦 Agent distribution** via Docker registry integration
 - **🔒 Security-first design** with proper client scoping and resource isolation
 - **⚡ Event-driven streaming** for real-time interactions
-- **🧠 Multi-model support** (OpenAI, Anthropic, Gemini, [Docker Model Runner (DMR)](https://docs.docker.com/ai/model-runner/))
+- **🧠 Multi-model support** (OpenAI, Anthropic, Gemini, [AWS Bedrock](https://aws.amazon.com/bedrock/), [Docker Model Runner (DMR)](https://docs.docker.com/ai/model-runner/))
 
 
 ## Why?
@@ -23,7 +23,7 @@ agents with specialized capabilities and tools. It features:
 After passing the last year+ building AI agents of various types, using a variety of software solutions and frameworks, we kept asking ourselves some of the same questions:
 
 - How can we make building and running useful agentic systems less of a hassle?
-- Most agents we build end up use many of the same building blocks. Can we re-use most of those building block and have declarative configurations for new agents?
+- Most agents we build end up using many of the same building blocks. Can we re-use most of those building block and have declarative configurations for new agents?
 - How can we package and share agents amongst each other as simply as possible without all the headaches?
 
 We really think we're getting somewhere as we build out the primitives of `cagent` so, in keeping with our love for open-source software in general, we decided to **share it and build it in the open** to allow the community at large to make use of our work and contribute to the future of the project itself. 
@@ -71,18 +71,238 @@ $ cagent pull docker.io/user/agent    # Pull agent from registry
 $ cagent push docker.io/user/agent    # Push agent to registry
 ```
 
+#### Default agent
+
+cagent handles a special case for a **default** agent. Running `cagent run` or `cagent run default`
+will quickly open the TUI on a default, basic agent. This agent is capable and has a few tools
+but is not a replacement for a more specialized agent. It's here for when you don't think you need
+a special agent.
+
+#### Aliases
+
+When using the same agent over and over again, from different working directories, it can be cumbersome
+to run `cagent run /full/path/to/the/agent`.
+
+That's where `aliases` come in handy. You can define has many short aliases as you want to full
+agent file paths of names.
+
+```bash
+cagent alias ls           # List the aliases
+
+cagent alias add pirate /full/path/to/the/pirate.yaml
+cagent run pirate
+
+cagent alias add other ociReference
+cagent run other
+```
+
+It's even possible to replace the `default` agent with `aliases`:
+
+```bash
+cagent alias add default /full/path/to/the/pirate.yaml
+cagent run                # Runs the pirate.yaml agent
+```
+
+**Alias Options:**
+
+You can configure aliases with runtime options that are automatically applied when the alias is used:
+
+```bash
+# Create an alias that always runs in yolo mode (auto-approve tool calls)
+cagent alias add yolo-coder agentcatalog/coder --yolo
+
+# Create an alias with a specific model override
+cagent alias add fast-coder agentcatalog/coder --model openai/gpt-4o-mini
+
+# Create an alias with both options
+cagent alias add turbo agentcatalog/coder --yolo --model anthropic/claude-sonnet-4-0
+```
+
+When listing aliases, options are displayed in brackets:
+
+```bash
+$ cagent alias ls
+Registered aliases (3):
+
+  fast-coder  → agentcatalog/coder [model=openai/gpt-4o-mini]
+  turbo       → agentcatalog/coder [yolo, model=anthropic/claude-sonnet-4-0]
+  yolo-coder  → agentcatalog/coder [yolo]
+
+Run an alias with: cagent run <alias>
+```
+
+**Note:** Command-line flags override alias options. For example, `cagent run yolo-coder --yolo=false` will run the alias without yolo mode.
+
 ### Interface-Specific Features
 
-#### CLI Interactive Commands
+#### File Attachments
 
-During CLI sessions, you can use special commands:
+In the TUI, you can attach file contents to your message using the `@` trigger:
 
-| Command    | Description                                 |
-|------------|---------------------------------------------|
-| `/exit`    | Exit the program                            |
-| `/reset`   | Clear conversation history                  |
-| `/eval`    | Save current conversation for evaluation    |
-| `/compact` | Compact conversation to lower context usage |
+1. Type `@` to open the file completion menu
+2. Start typing to filter files (respects `.gitignore`)
+3. Select a file to insert the reference (e.g., `@src/main.go`)
+4. When you send your message, the file contents are automatically expanded and attached at the end of your message, while `@somefile.txt` references stay in your message so the LLM can reference the file contents in the context of your question
+
+**Example:**
+```
+Explain what the code in @pkg/agent/agent.go does
+```
+
+The agent gets the full file contents and places them in a structured `<attachments>`
+block at the end of the message, while the UI doesn't display full file contents.
+
+#### TUI Interactive Commands
+
+During TUI sessions, you can use special slash commands. Type `/` to see all available commands or use the command palette (Ctrl+K):
+
+| Command     | Description                                                         |
+|-------------|---------------------------------------------------------------------|
+| `/attach`   | Attach a file to your message (usage: /attach [path])               |
+| `/compact`  | Summarize the current conversation (usage: /compact [instructions]) |
+| `/copy`     | Copy the current conversation to the clipboard                      |
+| `/cost`     | Show detailed cost breakdown for this session                       |
+| `/eval`     | Create an evaluation report (usage: /eval [filename])               |
+| `/exit`     | Exit the application                                                |
+| `/export`   | Export the session as HTML (usage: /export [filename])              |
+| `/model`    | Change the model for the current agent (see [Model Switching](#runtime-model-switching)) |
+| `/new`      | Start a new conversation                                            |
+| `/sessions` | Browse and load past sessions                                       |
+| `/shell`    | Start a shell                                                       |
+| `/star`     | Toggle star on current session                                      |
+| `/theme`    | Change the color theme (see [Theming](#theming))                    |
+| `/think`    | Toggle thinking/reasoning mode                                      |
+| `/title`    | Set or regenerate session title (usage: /title [new title])         |
+| `/yolo`     | Toggle automatic approval of tool calls                             |
+
+#### Runtime Model Switching
+
+The `/model` command (or `ctrl+m`) allows you to change the AI model used by the current agent during a session. This is useful when you want to:
+
+- Switch to a more capable model for complex tasks
+- Use a faster/cheaper model for simple queries
+- Test different models without modifying your YAML configuration
+
+**How it works:**
+
+1. Type `/model`, `Ctrl+M` or use the command palette (`Ctrl+K`) and select "Model"
+2. A picker dialog opens showing:
+   - **Config models**: All models defined in your YAML configuration, with the agent's default model marked as "(default)"
+   - **Custom input**: Type any model in `provider/model` format  
+   (e.g., `openai/gpt-5`, `anthropic/claude-sonnet-4-0`)  
+   Alloy models are supported with comma separated definitions (e.g. `provider1/model1,provider2/model2,...`)
+3. Select a model or type a custom one and press Enter
+
+**Persistence:** Your model choice is saved with the session. When you reload a past session using `/sessions`, the model you selected will automatically be restored.
+
+To revert to the agent's default model, select the model marked with "(default)" in the picker.
+
+#### Theming
+
+The TUI supports customizable color themes. You can create and use custom themes to personalize the appearance of the terminal interface.
+
+**Theme Configuration:**
+
+Your theme preference is saved globally in `~/.config/cagent/config.yaml` under `settings.theme`. If not set, the built-in default theme is used.
+
+**Creating Custom Themes:**
+
+Create theme files in `~/.cagent/themes/` as YAML files (`.yaml` or `.yml`). Theme files are **partial overrides** — you only need to specify the colors you want to change. Any omitted keys fall back to the built-in default theme values.
+
+```yaml
+# ~/.cagent/themes/my-theme.yaml
+name: "My Custom Theme"
+
+colors:
+  # Backgrounds
+  background: "#1a1a2e"
+  background_alt: "#16213e"
+  
+  # Text colors
+  text_bright: "#ffffff"
+  text_primary: "#e8e8e8"
+  text_secondary: "#b0b0b0"
+  text_muted: "#707070"
+  
+  # Accent colors
+  accent: "#4fc3f7"
+  brand: "#1d96f3"
+  
+  # Status colors
+  success: "#4caf50"
+  error: "#f44336"
+  warning: "#ff9800"
+  info: "#00bcd4"
+
+# Optional: Customize syntax highlighting colors
+chroma:
+  comment: "#6a9955"
+  keyword: "#569cd6"
+  literal_string: "#ce9178"
+
+# Optional: Customize markdown rendering colors
+markdown:
+  heading: "#4fc3f7"
+  link: "#569cd6"
+  code: "#ce9178"
+```
+
+**Applying Themes:**
+
+- **In user config** (`~/.config/cagent/config.yaml`):
+  ```yaml
+  settings:
+    theme: my-theme  # References ~/.cagent/themes/my-theme.yaml
+  ```
+
+- **At runtime**: Use the `/theme` command to open the theme picker and select from available themes. Your selection is automatically saved to user config and persists across sessions.
+
+**Hot Reload:** Custom theme files are automatically watched for changes. When you edit a user theme file (in `~/.cagent/themes/`), the changes are applied immediately without needing to restart cagent or re-select the theme. This makes it easy to customize themes while seeing changes in real-time.
+
+
+> **Note:** All user themes are partial overrides applied on top of the `default` theme. If you want to customize a built-in theme, copy the full YAML from the [built-in themes on GitHub](https://github.com/docker/cagent/tree/main/pkg/tui/styles/themes) into `~/.cagent/themes/` and edit the copy. Otherwise, omitted values will use `default` colors, not the original theme's colors.
+
+**Built-in Themes:**
+
+The following themes are included:
+- `default` — The built-in default theme with a dark color scheme
+- `catppuccin-latte`, `catppuccin-mocha` — Catppuccin themes (light and dark)
+- `dracula` — Dracula dark theme
+- `gruvbox-dark`, `gruvbox-light` — Gruvbox themes
+- `nord` — Nord dark theme
+- `one-dark` — One Dark theme
+- `solarized-dark` — Solarized dark theme
+- `tokyo-night` — Tokyo Night dark theme
+
+**Available Color Keys:**
+
+Themes can customize colors in three sections: `colors`, `chroma` (syntax highlighting), and `markdown` (markdown rendering).
+
+See the [built-in themes on GitHub](https://github.com/docker/cagent/tree/main/pkg/tui/styles/themes) for complete examples.
+
+#### Session Title Editing
+
+You can customize session titles to make them more meaningful and easier to find later. By default, cagent automatically generates titles based on your first message, but you can override or regenerate them at any time.
+
+**Using the `/title` command:**
+
+```
+/title                     # Regenerate title using AI (based on at most the last 2 user messages)
+/title My Custom Title     # Set a specific title
+```
+
+**Using the sidebar:**
+
+In the TUI, you can click on the pencil icon (✎) next to the session title in the sidebar to edit it inline:
+
+1. Click the pencil icon next to the title
+2. Type your new title
+3. Press Enter to save, or Escape to cancel
+
+**Notes:**
+- Manually set titles are preserved and won't be overwritten by auto-generation
+- Title changes are persisted immediately to the session
+- Works with both local and remote runtimes
 
 ## 🔧 Configuration Reference
 
@@ -143,7 +363,7 @@ cagent run ./agent.yaml /analyze
 
 | Property            | Type       | Description                                                                  | Required |
 |---------------------|------------|------------------------------------------------------------------------------|----------|
-| `provider`          | string     | Provider: `openai`, `anthropic`, `google`, `dmr`                             | ✓        |
+| `provider`          | string     | Provider: `openai`, `anthropic`, `google`, `amazon-bedrock`, `dmr`           | ✓        |
 | `model`             | string     | Model name (e.g., `gpt-4o`, `claude-sonnet-4-0`, `gemini-2.5-flash`)         | ✓        |
 | `temperature`       | float      | Randomness (0.0-1.0)                                                         | ✗        |
 | `max_tokens`        | integer    | Response length limit                                                        | ✗        |
@@ -158,7 +378,7 @@ cagent run ./agent.yaml /analyze
 ```yaml
 models:
   model_name:
-    provider: string # Provider: openai, anthropic, google, dmr
+    provider: string # Provider: openai, anthropic, google, amazon-bedrock, dmr
     model: string # Model name: gpt-4o, claude-3-7-sonnet-latest, gemini-2.5-flash, qwen3:4B, ...
     temperature: float # Randomness (0.0-1.0)
     max_tokens: integer # Response length limit
@@ -173,9 +393,31 @@ models:
 
 Determine how much the model should think by setting the `thinking_budget`
 
-- **OpenAI**: use effort levels — `minimal`, `low`, `medium`, `high`
-- **Anthropic**: set an integer token budget. Range is 1024–32768; must be strictly less than `max_tokens`.
-- **Google (Gemini)**: set an integer token budget. `0` -> disable thinking, `-1` -> dynamic thinking (model decides). Most models: 0–24576 tokens. Gemini 2.5 Pro: 128–32768 tokens (and cannot disable thinking). 
+- **Disable thinking**: Use `none` (string) or `0` (integer) to explicitly disable thinking for any provider
+- **OpenAI**: use effort levels — `minimal`, `low`, `medium`, `high`. Default: `medium`
+- **Anthropic**: set an integer token budget. Range is 1024–32768; must be strictly less than `max_tokens`. Default: `8192` with `interleaved_thinking: true`
+- **Google (Gemini 2.5)**: set an integer token budget. `0` -> disable thinking, `-1` -> dynamic thinking (model decides). Default: `-1` (dynamic)
+- **Google (Gemini 3)**: use effort levels — `minimal` (Flash only), `low`, `medium`, `high`. Default: `high` for Pro, `medium` for Flash
+- **Amazon Bedrock (Claude models)**: set an integer token budget, same as Anthropic. Default: `8192` with `interleaved_thinking: true`
+
+**Disabling thinking:**
+
+```yaml
+models:
+  # Using string "none"
+  gpt-no-thinking:
+    provider: openai
+    model: gpt-5
+    thinking_budget: none # or 0
+
+  # Using integer 0
+  claude-no-thinking:
+    provider: anthropic
+    model: claude-sonnet-4-5
+    thinking_budget: 0 # or none
+```
+
+Note: When thinking is disabled via config, it can still be enabled during a session using the `/think` command, which will restore the provider's default thinking configuration.
 
 Examples (OpenAI):
 
@@ -207,7 +449,7 @@ agents:
     instruction: you are a helpful assistant that doesn't think very much
 ```
 
-Examples (Google):
+Examples (Google Gemini 2.5 - token-based):
 
 ```yaml
 models:
@@ -219,7 +461,7 @@ models:
   gemini-dynamic:
     provider: google
     model: gemini-2.5-flash
-    thinking_budget: -1  # Dynamic thinking (model decides)
+    thinking_budget: -1  # Dynamic thinking (model decides) - this is the default
 
   gemini-fixed:
     provider: google
@@ -232,28 +474,101 @@ agents:
     instruction: you are a helpful assistant
 ```
 
-#### Interleaved Thinking (Anthropic)
+Examples (Google Gemini 3 - level-based):
 
-Anthropic's interleaved thinking feature uses the Beta Messages API to provide tool calling during model reasoning. You can control this behavior using the `interleaved_thinking` provider option:
+```yaml
+models:
+  # Gemini 3 Pro: supports "low" and "high" levels
+  gemini-3-pro-high:
+    provider: google
+    model: gemini-3-pro
+    thinking_budget: high  # Default for Pro models
+
+  gemini-3-pro-low:
+    provider: google
+    model: gemini-3-pro
+    thinking_budget: low
+
+  # Gemini 3 Flash: supports "minimal", "low", "medium", "high" levels
+  gemini-3-flash-medium:
+    provider: google
+    model: gemini-3-flash
+    thinking_budget: medium  # Default for Flash models
+
+  gemini-3-flash-minimal:
+    provider: google
+    model: gemini-3-flash
+    thinking_budget: minimal
+
+agents:
+  root:
+    model: gemini-3-pro-high
+    instruction: you are a helpful assistant
+```
+
+Examples (Amazon Bedrock Claude):
+
+```yaml
+models:
+  bedrock-claude:
+    provider: amazon-bedrock
+    model: global.anthropic.claude-sonnet-4-5-20250929-v1:0
+    # thinking_budget defaults to 8192 and interleaved_thinking defaults to true for Claude models
+    provider_opts:
+      region: us-east-1
+
+  bedrock-claude-custom:
+    provider: amazon-bedrock
+    model: anthropic.claude-sonnet-4-20250514-v1:0
+    thinking_budget: 16384  # Override default
+    provider_opts:
+      region: eu-west-1
+      interleaved_thinking: true
+
+agents:
+  root:
+    model: bedrock-claude
+    instruction: you are a helpful assistant
+```
+
+#### Interleaved Thinking (Anthropic and Bedrock Claude)
+
+Anthropic's interleaved thinking feature uses the Beta Messages API to provide tool calling during model reasoning. This is now enabled by default for both `anthropic` and `amazon-bedrock` (Claude models) providers. You can control this behavior using the `interleaved_thinking` provider option:
 
 ```yaml
 models:
   claude:
     provider: anthropic
     model: claude-sonnet-4-5-20250929
-    thinking_budget: 8192  # Optional: defaults to 16384 when interleaved thinking is enabled
+    # thinking_budget defaults to 8192
+    # interleaved_thinking defaults to true
     provider_opts:
-      interleaved_thinking: true   # Enable interleaved thinking (default: false)
+      interleaved_thinking: false  # Disable if needed
+
+  bedrock-claude:
+    provider: amazon-bedrock
+    model: global.anthropic.claude-sonnet-4-5-20250929-v1:0
+    # thinking_budget defaults to 8192 for Claude models
+    # interleaved_thinking defaults to true for Claude models
+    provider_opts:
+      region: us-east-1
+      interleaved_thinking: false  # Disable if needed
 ```
 
 Notes:
 
-- **OpenAI**: If an invalid effort value is set, the request will fail with a clear error
-- **Anthropic**: Values < 1024 or ≥ `max_tokens` are ignored (warning logged). When `interleaved_thinking` is enabled, cagent uses Anthropic's Beta Messages API with a default thinking budget of 16384 tokens if not specified
-- **Google**: 
+- **OpenAI**: If an invalid effort value is set, the request will fail with a clear error. Default: `medium`
+- **Anthropic**: Values < 1024 or ≥ `max_tokens` are ignored (warning logged). Default: `thinking_budget: 8192` with `interleaved_thinking: true`
+- **Amazon Bedrock (Claude)**: Same behavior as Anthropic. Non-Claude Bedrock models are not affected by defaults
+- **Google (Gemini 2.5)**: 
   - Most models support values between -1 and 24576 tokens. Set to `0` to disable, `-1` for dynamic thinking
   - Gemini 2.5 Pro: supports 128–32768 tokens. Cannot be disabled (minimum 128)
   - Gemini 2.5 Flash-Lite: supports 512–24576 tokens. Set to `0` to disable, `-1` for dynamic thinking
+  - Default: `-1` (dynamic thinking)
+- **Google (Gemini 3)**:
+  - Uses effort levels instead of token budgets: `minimal` (Flash only), `low`, `medium`, `high`
+  - Gemini 3 Pro default: `high`
+  - Gemini 3 Flash default: `medium`
 - For unsupported providers, `thinking_budget` has no effect
 - Debug logs include the applied effort (e.g., "OpenAI request using thinking_budget", "Gemini request using thinking_budget")
 
@@ -284,6 +599,12 @@ models:
     provider: google
     model: gemini-2.5-flash
 
+# AWS Bedrock
+models:
+  claude-bedrock:
+    provider: amazon-bedrock
+    model: global.anthropic.claude-sonnet-4-5-20250929-v1:0  # Global inference profile
+
 # Docker Model Runner (DMR)
 models:
   qwen:
@@ -291,9 +612,120 @@ models:
     model: ai/qwen3
 ```
 
+#### AWS Bedrock provider usage
+
+**Prerequisites:**
+- AWS account with Bedrock enabled in your region
+- Model access granted in the [Bedrock Console](https://console.aws.amazon.com/bedrock/) (some models require approval)
+- AWS credentials configured (see authentication below)
+
+**Authentication:**
+
+Bedrock supports two authentication methods:
+
+**Option 1: Bedrock API key** (simplest)
+
+Set the `AWS_BEARER_TOKEN_BEDROCK` environment variable with your Bedrock API key. You can customize the env var name using `token_key`:
+
+```yaml
+models:
+  claude-bedrock:
+    provider: amazon-bedrock
+    model: global.anthropic.claude-sonnet-4-5-20250929-v1:0
+    token_key: AWS_BEARER_TOKEN_BEDROCK  # Name of env var containing your token (default)
+    provider_opts:
+      region: us-east-1
+```
+
+Generate API keys in the [Bedrock Console](https://console.aws.amazon.com/bedrock/) under "API keys".
+
+**Option 2: AWS credentials** (default)
+
+Uses the [AWS SDK default credential chain](https://docs.aws.amazon.com/sdk-for-go/v1/developer-guide/configuring-sdk.html#specifying-credentials):
+
+1. Environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`)
+2. Shared credentials file (`~/.aws/credentials`)
+3. Shared config file (`~/.aws/config` with `AWS_PROFILE`)
+4. IAM instance roles (EC2, ECS, Lambda)
+
+You can also use `provider_opts.role_arn` for cross-account role assumption.
+
+**Basic usage with AWS profile:**
+
+```yaml
+models:
+  claude-bedrock:
+    provider: amazon-bedrock
+    model: global.anthropic.claude-sonnet-4-5-20250929-v1:0
+    max_tokens: 64000
+    provider_opts:
+      profile: my-aws-profile
+      region: us-east-1
+```
+
+**With IAM role assumption:**
+
+```yaml
+models:
+  claude-bedrock:
+    provider: amazon-bedrock
+    model: anthropic.claude-3-sonnet-20240229-v1:0
+    provider_opts:
+      role_arn: "arn:aws:iam::123456789012:role/BedrockAccessRole"
+      external_id: "my-external-id"
+```
+
+**provider_opts for Bedrock:**
+
+| Option | Type | Description | Default |
+|--------|------|-------------|---------|
+| `region` | string | AWS region | us-east-1 |
+| `profile` | string | AWS profile name | (default chain) |
+| `role_arn` | string | IAM role ARN for assume role | (none) |
+| `role_session_name` | string | Session name for assumed role | cagent-bedrock-session |
+| `external_id` | string | External ID for role assumption | (none) |
+| `endpoint_url` | string | Custom endpoint (VPC/testing) | (none) |
+| `interleaved_thinking` | bool | Enable reasoning during tool calls (requires thinking_budget) | false |
+| `disable_prompt_caching` | bool | Disable automatic prompt caching | false |
+
+#### Prompt Caching (Bedrock)
+
+Prompt caching is automatically enabled for models that support it (detected via models.dev) to reduce latency and costs. System prompts, tool definitions, and recent messages are cached with a 5-minute TTL.
+
+To disable:
+
+```yaml
+provider_opts:
+  disable_prompt_caching: true
+```
+
+**Supported models (via Converse API):**
+
+All Bedrock models that support the Converse API work with cagent. Use inference profile IDs for best availability:
+
+- **Anthropic Claude**: `global.anthropic.claude-sonnet-4-5-20250929-v1:0`, `us.anthropic.claude-haiku-4-5-20251001-v1:0`
+- **Amazon Nova**: `global.amazon.nova-2-lite-v1:0`
+- **Meta Llama**: `us.meta.llama3-2-90b-instruct-v1:0`
+- **Mistral**: `us.mistral.mistral-large-2407-v1:0`
+
+**Inference profile prefixes:**
+
+| Prefix | Routes to |
+|--------|-----------|
+| `global.` | All commercial AWS regions (recommended) |
+| `us.` | US regions only |
+| `eu.` | EU regions only (GDPR compliance) |
+
+```yaml
+models:
+  claude-global:
+    provider: amazon-bedrock
+    model: global.anthropic.claude-sonnet-4-5-20250929-v1:0  # Routes to any available region
+```
+
 #### DMR (Docker Model Runner) provider usage
 
-If `base_url` is omitted, cagent will use `http://localhost:12434/engines/llama.cpp/v1` by default
+If `base_url` is omitted, Docker `cagent` will use `http://localhost:12434/engines/llama.cpp/v1` by default
 
 You can pass DMR runtime (e.g. llama.cpp) options using  
 ```
@@ -346,7 +778,7 @@ Requirements and notes:
 - Docker Model plugin must be available for auto-configure/auto-discovery
   - Verify with: `docker model status --json`
 - Configuration is best-effort; failures fall back to the default base URL
-- `provider_opts` currently apply to `dmr` and `anthropic` providers
+- `provider_opts` currently apply to `dmr`, `anthropic`, and `amazon-bedrock` providers
 - `runtime_flags` are passed after `--` to the inference runtime (e.g., llama.cpp)
 
 Parameter mapping and precedence (DMR):
@@ -357,7 +789,8 @@ Parameter mapping and precedence (DMR):
   - `frequency_penalty` → `--frequency-penalty`
   - `presence_penalty` → `--presence-penalty`
   ...
-- `provider_opts.runtime_flags` always take priority over derived flags on conflict. When a conflict is detected, cagent logs a warning indicating the overridden flag. `max_tokens` is the only exception for now
+- `provider_opts.runtime_flags` always take priority over derived flags on conflict. When a conflict is detected,
+Docker `cagent` logs a warning indicating the overridden flag. `max_tokens` is the only exception for now
 
 Examples:
 
@@ -398,16 +831,16 @@ models:
       speculative_acceptance_rate: 0.8         # Acceptance rate threshold
 ```
 
-All three speculative decoding options are passed to `docker model configure` as flags:
-- `speculative_draft_model` → `--speculative-draft-model`
-- `speculative_num_tokens` → `--speculative-num-tokens`
-- `speculative_acceptance_rate` → `--speculative-acceptance-rate`
+All three speculative decoding options are sent to Model Runner via its internal `POST /engines/_configure` API endpoint:
+- `speculative_draft_model` → `speculative.draft_model`
+- `speculative_num_tokens` → `speculative.num_tokens`
+- `speculative_acceptance_rate` → `speculative.min_acceptance_rate`
 
-These options work alongside `max_tokens` (which sets `--context-size`) and `runtime_flags`.
+These options work alongside `max_tokens` (which sets `context-size`) and `runtime_flags`.
 
 ##### Troubleshooting:
 
-- Plugin not found: cagent will log a debug message and use the default base URL
+- Plugin not found: Docker `cagent` will log a debug message and use the default base URL
 - Endpoint empty in status: ensure the Model Runner is running, or set `base_url` manually
 - Flag parsing: if using a single string, quote properly in YAML; you can also use a list
 
@@ -513,11 +946,11 @@ toolsets:
 
 ### Installing MCP Tools
 
-Example installation of local tools with `cargo` or `npm`:
+Example installation of local tools with `npm`:
 
 ```bash
 # Install Rust-based MCP filesystem tool
-cargo install rust-mcp-filesystem
+npm i -g @rustmcp/rust-mcp-filesystem@latest
 
 # Install other popular MCP tools
 npm install -g @modelcontextprotocol/server-filesystem
@@ -588,6 +1021,469 @@ them to delegate tasks to other agents:
 ```
 transfer_task(agent="developer", task="Create a login form", expected_output="HTML and CSS code")
 ```
+
+## RAG (Retrieval-Augmented Generation)
+
+Give your agents access to document knowledge bases using cagent's modular RAG system. It supports:
+- Background indexing of files;
+- Re-indexing on file changes;
+- Using one or more retrieval strategies that can be used individually or combined for hybrid search.
+
+### RAG Configuration
+
+Configure RAG sources at the top level of your config, then reference them in agents:
+
+```yaml
+rag:
+  my_docs:
+    description: "Technical documentation knowledge base"
+    docs: [./documents, ./some-doc.md]
+    strategies:
+      - type: chunked-embeddings
+        model: openai/text-embedding-3-small
+        database: ./docs.db
+        vector_dimensions: 1536
+
+agents:
+  root:
+    model: openai/gpt-4o
+    instruction: |
+      You are an assistant with access to an internal knowledge base.
+      Use the knowledge base to gather context before answering user questions
+    rag: [my_docs]  # Reference the RAG source
+```
+
+### Retrieval Strategies
+
+#### Chunked-Embeddings Strategy (Semantic Search)
+
+Uses embedding models for semantic similarity:
+
+```yaml
+rag:
+  semantic_search:
+    docs: [./knowledge_base]
+    strategies:
+      - type: chunked-embeddings
+        model: openai/text-embedding-3-small
+        database: ./vector.db
+        vector_dimensions: 1536
+        similarity_metric: cosine_similarity
+        threshold: 0.5
+        limit: 10
+        batch_size: 50
+        max_embedding_concurrency: 3
+        chunking:
+          size: 1000
+          overlap: 100
+```
+
+**Best for:** Understanding intent, synonyms, paraphrasing, multilingual queries
+
+#### Semantic-Embeddings Strategy (LLM-Enhanced Semantic Search)
+
+Uses an LLM to generate semantic summaries of each chunk before embedding, capturing meaning and intent rather than raw text:
+
+```yaml
+rag:
+  code_search:
+    docs: [./src, ./pkg]
+    strategies:
+      - type: semantic-embeddings
+        embedding_model: openai/text-embedding-3-small
+        vector_dimensions: 1536
+        chat_model: openai/gpt-4o-mini        # LLM for generating summaries
+        database: ./semantic.db
+        threshold: 0.3
+        limit: 10
+        ast_context: true                     # Include AST metadata in prompts
+        chunking:
+          size: 1000
+          code_aware: true                    # AST-aware chunking for best results
+```
+
+**Best for:** Code search, understanding intent, finding implementations by what they do rather than exact names
+
+**Trade-offs:** Higher quality retrieval but slower indexing (LLM call per chunk) and additional API costs
+
+**Parameters:**
+- `embedding_model` (required): Embedding model for vector similarity
+- `chat_model` (required): Chat model to generate semantic summaries
+- `vector_dimensions` (required): Embedding vector dimensions
+- `semantic_prompt`: Custom prompt template (uses `${path}`, `${content}`, `${ast_context}` placeholders)
+- `ast_context`: Include TreeSitter AST metadata in prompts (default: `false`)
+
+#### BM25 Strategy (Keyword Search)
+
+Uses traditional keyword matching:
+
+```yaml
+rag:
+  keyword_search:
+    docs: [./knowledge_base]
+    strategies:
+      - type: bm25
+        database: ./bm25.db
+        k1: 1.5                    # Term frequency saturation
+        b: 0.75                    # Length normalization
+        threshold: 0.3             # Minimum BM25 score
+        limit: 10
+        chunking:
+          size: 1000
+          overlap: 100
+```
+
+**Best for:** Exact terms, technical jargon, proper nouns, code
+
+### Hybrid Retrieval
+
+Combine multiple strategies for best results:
+
+```yaml
+rag:
+  hybrid_search:
+    docs: [./shared_docs]           # Documents indexed by all strategies
+    
+    strategies:
+      - type: chunked-embeddings
+        model: embedder
+        docs: [./docs]                # Additional chunked-embeddings-specific docs
+        database: ./vector.db
+        threshold: 0.5
+        limit: 20                     # Retrieve 20 candidates
+        chunking: {size: 1000, overlap: 100}
+      
+      - type: bm25
+        docs: [./code]                # Additional BM25-specific docs
+        database: ./bm25.db
+        k1: 1.5
+        b: 0.75
+        threshold: 0.3
+        limit: 15                     # Retrieve 15 candidates
+        chunking: {size: 1000, overlap: 100}
+    
+    results:
+      fusion:
+        strategy: rrf               # Reciprocal Rank Fusion
+        k: 60
+      deduplicate: true
+      limit: 5                      # Final top 5 results
+
+agents:
+  root:
+    model: openai/gpt-4o
+    rag: [hybrid_search]
+```
+
+**Features:**
+- **Parallel execution**: Strategies run concurrently (total time = max, not sum)
+- **Per-strategy docs**: Different content for different strategies
+- **Multi-level limits**: Strategy limits control fusion input, final limit controls output
+- **Automatic fusion**: Combines results intelligently
+
+### Fusion Strategies
+
+When using multiple retrieval strategies, choose how to combine results:
+
+#### Reciprocal Rank Fusion (RRF) - Recommended
+
+```yaml
+results:
+  fusion:
+    strategy: rrf
+    k: 60  # Smoothing parameter (higher = more uniform ranking)
+```
+
+**Best for:** Combining different retrieval methods. Rank-based, doesn't require score normalization.
+
+#### Weighted Fusion
+
+```yaml
+results:
+  fusion:
+    strategy: weighted
+    weights:
+      chunked-embeddings: 0.7
+      bm25: 0.3
+```
+
+**Best for:** When you know which strategy performs better for your use case.
+
+#### Max Score Fusion
+
+```yaml
+results:
+  fusion:
+    strategy: max
+```
+
+**Best for:** Strategies using the same scoring scale. Takes maximum score.
+
+### Result Reranking
+
+Reranking re-scores retrieved documents using a specialized model to improve relevance. This is applied **after** retrieval and fusion, but **before** the final limit.
+
+#### Why Rerank?
+
+Initial retrieval strategies (embeddings, BM25) are fast but approximate. Reranking uses a more sophisticated model to:
+- Improve relevance scoring accuracy
+- Apply domain-specific criteria
+- Consider document metadata (source, recency, type)
+- Filter low-quality results
+
+#### Provider Support
+
+| Provider   | Implementation                          | Recommended Use Case         |
+|------------|-----------------------------------------|------------------------------|
+| DMR        | Native `/rerank` endpoint               | Production (fast, efficient) |
+| OpenAI     | Chat completion + structured outputs    | Flexible, criteria-based     |
+| Anthropic  | Beta API + structured outputs           | Complex relevance rules      |
+| Gemini     | Structured outputs                      | Cost-effective scoring       |
+
+#### Basic Reranking Configuration
+
+```yaml
+rag:
+  docs_with_reranking:
+    docs: [./knowledge_base]
+    strategies:
+      - type: chunked-embeddings
+        model: openai/text-embedding-3-small
+        limit: 20  # Retrieve more candidates for reranking
+    
+    results:
+      reranking:
+        model: openai/gpt-4o-mini
+      limit: 5  # Final results after reranking
+```
+
+#### Advanced Reranking Configuration
+
+```yaml
+rag:
+  advanced_reranking:
+    docs: [./documents]
+    strategies:
+      - type: chunked-embeddings
+        model: embedder
+        limit: 20
+    
+    results:
+      reranking:
+        model: openai/gpt-4o-mini
+        
+        # top_k: Only rerank top K results (optional)
+        # Useful for cost optimization when retrieving many documents
+        # Set to 0 or omit to rerank all results
+        top_k: 10
+        
+        # threshold: Minimum relevance score (0.0-1.0) after reranking (default: 0.5)
+        # Results below threshold are filtered out
+        # Applied before final limit
+        threshold: 0.3
+        
+        # criteria: Domain-specific relevance guidance (optional)
+        # The model receives metadata: source path, chunk index, created_at
+        # Use this to guide scoring based on source, recency, or content type
+        criteria: |
+          When scoring relevance, prioritize:
+          - Content from official documentation over blog posts
+          - Recent information (check created_at dates)
+          - Practical examples and implementation details
+          - Documents from docs/ directory when available
+      
+      deduplicate: true
+      limit: 5
+```
+
+#### DMR Native Reranking
+
+DMR offers a native reranking endpoint:
+
+```yaml
+models:
+  dmr-reranker:
+    provider: dmr
+    model: hf.co/ggml-org/qwen3-reranker-0.6b-q8_0-gguf # reranking specific model
+    # Note: Native reranking doesn't support criteria parameter
+
+rag:
+  knowledge_base:
+    docs: [./documents]
+    strategies:
+      - type: chunked-embeddings
+        model: embedder
+        limit: 20
+    
+    results:
+      reranking:
+        model: dmr-reranker
+        threshold: 0.5
+      limit: 5
+```
+
+#### Reranking Model Configuration
+
+Configure sampling parameters for deterministic or creative scoring. Note that temperature defaults to 0.0 for reranking when not explicitly set:
+
+```yaml
+models:
+  # Deterministic reranking (default behavior)
+  openai-rerank:
+    provider: openai
+    model: gpt-4o-mini
+    # temperature: 0.0  # Default for reranking (explicit setting optional)
+    max_tokens: 16384
+  
+  # Anthropic with structured outputs
+  claude-rerank:
+    provider: anthropic
+    model: claude-sonnet-4-5 # model needs to support structured outputs
+    # temperature: 0.0  # Default for reranking
+    max_tokens: 16384
+  
+  # Gemini reranking
+  gemini-rerank:
+    provider: google
+    model: gemini-2.5-flash
+    # temperature: 0.0  # Default for reranking
+    max_tokens: 16384
+```
+
+#### Reranking Configuration Reference
+
+| Field        | Type    | Description                                                           | Default |
+|--------------|---------|-----------------------------------------------------------------------|---------|
+| `model`      | string  | Model reference for reranking                                         | -       |
+| `top_k`      | int     | Only rerank top K results (0 = rerank all)                            | 0       |
+| `threshold`  | float   | Minimum score (0.0-1.0) after reranking                               | 0.5     |
+| `criteria`   | string  | Domain-specific relevance guidance (not supported by DMR native)      | ""      |
+
+**Notes:**
+- Reranking adds latency but significantly improves result quality
+- Use `top_k` to trade quality for speed and cost
+- Temperature defaults to 0.0 for deterministic scoring when not explicitly set (OpenAI, Anthropic, Gemini)
+- Default threshold of 0.5 filters documents with negative logits (sigmoid < 0.5 = not relevant)
+- DMR native reranking is fastest but doesn't support custom criteria
+- Criteria works with OpenAI, Anthropic, and Gemini (chat-based reranking using structured-outputs)
+- Fallback: If reranking fails, original post-fusion retrieval scores are used
+
+### RAG Configuration Reference
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `docs` | []string | Document paths/directories (shared across strategies) |
+| `description` | string | Human-readable description |
+| `respect_vcs` | boolean | Whether to respect VCS ignore files like .gitignore (default: `true`) |
+| `strategies` | []object | Array of strategy configurations |
+| `results` | object | Post-processing configuration |
+
+**Strategy Configuration:**
+- `type`: Strategy type (`chunked-embeddings`, `semantic-embeddings`, `bm25`)
+- `docs`: Strategy-specific documents (optional, augments shared docs)
+- `database`: Database configuration (path to local sqlite db)
+- `chunking`: Chunking configuration
+- `limit`: Max results from this strategy (for fusion)
+- `respect_vcs`: Override RAG-level VCS ignore setting for this strategy only (optional)
+
+**Chunked-Embeddings Strategy Parameters:**
+- `model` (required): Embedding model reference
+- `database`: Database configuration  
+  - simple string path to local sqlite db (e.g. `./vector.db`)
+- `similarity_metric`: Similarity metric (only `cosine_similarity` now, `euclidean_distance`, `dot_product`, etc to come in the future)
+- `threshold`: Minimum similarity (0–1, default: `0.5`)
+- `limit`: Max candidates from this strategy for fusion input (default: `5`)
+- `batch_size`: Number of chunks per embedding request (default: `50`)
+- `max_embedding_concurrency`: Maximum concurrent embedding batch requests (default: `3`)
+- `chunking.size`: Chunk size in characters (default: `1000`)
+- `chunking.overlap`: Overlap between chunks (default: `75`)
+
+**Semantic-Embeddings Strategy:**
+- `embedding_model` (required): Embedding model reference (e.g., `openai/text-embedding-3-small`)
+- `chat_model` (required): Chat model for generating semantic summaries (e.g., `openai/gpt-4o-mini`)
+- `vector_dimensions` (required): Embedding vector dimensions (e.g., `1536` for text-embedding-3-small)
+- `database`: Database configuration (same formats as chunked-embeddings)
+- `semantic_prompt`: Custom prompt template using JS template literals (`${path}`, `${basename}`, `${chunk_index}`, `${content}`, `${ast_context}`)
+- `ast_context`: Include TreeSitter AST metadata in semantic prompts. Useful for code (default: `false`, best with `code_aware` chunking)
+- `similarity_metric`: Similarity metric (default: `cosine_similarity`)
+- `threshold`: Minimum similarity (0–1, default: `0.5`)
+- `limit`: Max candidates from this strategy for fusion input (default: `5`)
+- `embedding_batch_size`: Chunks per embedding request (default: `50`)
+- `max_embedding_concurrency`: Concurrent embedding/LLM requests (default: `3`)
+- `max_indexing_concurrency`: Concurrent file indexing (default: `3`)
+- `chunking.size`: Chunk size in characters (default: `1000`)
+- `chunking.overlap`: Overlap between chunks (default: `75`)
+- `chunking.code_aware`: Use AST-based chunking (default: `false`, if `true` the `chunking.overlap` will be ignored)
+
+**BM25 Strategy:**
+- `database`: Database configuration (same formats as chunked-embeddings)
+- `k1`: Term frequency saturation (recommended range: `1.2–2.0`, default: `1.5`)
+- `b`: Length normalization (`0–1`, default: `0.75`)
+- `threshold`: Minimum BM25 score (default: `0.0`)
+- `limit`: Max candidates from this strategy for fusion input (default: `5`)
+- `chunking.size`: Chunk size in characters (default: `1000`)
+- `chunking.overlap`: Overlap between chunks (default: `75`)
+
+**Code-Aware Chunking:**
+
+When indexing source code, you can enable code-aware chunking to produce semantically aligned chunks based on the code's AST (Abstract Syntax Tree). This keeps functions and methods intact rather than splitting them arbitrarily:
+
+```yaml
+rag:
+  codebase:
+    docs: [./src]
+    strategies:
+      - type: bm25
+        database: ./code.db
+        chunking:
+          size: 2000
+          code_aware: true  # Enable AST-based chunking
+```
+
+- `chunking.code_aware`: When `true`, uses tree-sitter for AST-based chunking (default: `false`), and `size` becomes indicative
+
+**Notes:**
+- Currently supports **Go** source files (`.go`). More languages will be added incrementally.
+- Falls back to plain text chunking for unsupported file types.
+- Produces chunks that align with code structure (functions, methods, type declarations).
+- Particularly useful for code search and retrieval tasks.
+
+**Results:**
+- `limit`: Final number of results (default: `15`)
+- `deduplicate`: Remove duplicates (default: `true`)
+- `fusion.strategy`: rrf, weighted, or max
+- `fusion.k`: RRF parameter
+- `fusion.weights`: Weights for weighted fusion
+- `reranking`: Optional reranking configuration (see [Result Reranking](#result-reranking) section)
+  - `reranking.model`: Model reference for reranking
+  - `reranking.top_k`: Only rerank top K results (default: `0` = rerank all)
+  - `reranking.threshold`: Minimum score after reranking (default: `0.0`)
+  - `reranking.criteria`: Domain-specific relevance guidance (optional, not supported by DMR native)
+- `return_full_content`: When `true`, return full document contents instead of just matched chunks (default: `false`)
+
+### Debugging RAG
+
+Enable debug logging to see detailed retrieval and fusion information:
+
+```bash
+./bin/cagent run config.yaml --debug --log-file cagent.debug
+```
+
+Look for logs tagged with:
+- `[RAG Manager]` - Overall operations
+- `[Chunked-Embeddings Strategy]` - Chunked-embeddings retrieval
+- `[BM25 Strategy]` - BM25 retrieval
+- `[RRF Fusion]` / `[Weighted Fusion]` / `[Max Fusion]` - Result fusion
+- `[Reranker]` - Reranking operations and score adjustments
+
+### RAG Examples
+
+See `examples/rag/` directory:
+- `examples/rag/bm25.yaml` - BM25 strategy only
+- `examples/rag/hybrid.yaml` - Hybrid retrieval (chunked-embeddings + BM25)
+- `examples/rag/semantic_embeddings.yaml` - Semantic-embeddings strategy with LLM summaries
+- `examples/rag/reranking.yaml` - Reranking with various providers
+- `examples/rag/reranking_full_example.yaml` - Complete reranking configuration reference
 
 ## Examples
 
@@ -819,5 +1715,5 @@ agents:
     description: Creative content generation
 ```
 
-This guide should help you get started with cagent and build powerful
+This guide should help you get started with Docker `cagent` and build powerful
 multi-agent systems.

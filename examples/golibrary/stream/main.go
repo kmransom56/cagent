@@ -7,7 +7,7 @@ import (
 	"syscall"
 
 	"github.com/docker/cagent/pkg/agent"
-	latest "github.com/docker/cagent/pkg/config/v2"
+	"github.com/docker/cagent/pkg/config/latest"
 	"github.com/docker/cagent/pkg/environment"
 	"github.com/docker/cagent/pkg/model/provider/openai"
 	"github.com/docker/cagent/pkg/runtime"
@@ -51,7 +51,7 @@ func run(ctx context.Context) error {
 		return err
 	}
 
-	sess := session.New(session.WithUserMessage("", "How are you doing?"))
+	sess := session.New(session.WithUserMessage("How are you doing?"))
 
 	events := rt.RunStream(ctx, sess)
 	for event := range events {
@@ -63,7 +63,7 @@ func run(ctx context.Context) error {
 		case *runtime.StreamStoppedEvent:
 			log.Println("Stream stopped for session")
 		case *runtime.ToolCallConfirmationEvent:
-			rt.Resume(ctx, "approve-session")
+			rt.Resume(ctx, runtime.ResumeRequest{Type: runtime.ResumeTypeApproveSession})
 		case *runtime.ToolCallEvent:
 			log.Printf("Tool call: %s\n", e.ToolCall.Function.Name)
 		case *runtime.ToolCallResponseEvent:

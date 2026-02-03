@@ -1,12 +1,17 @@
 package tool
 
 import (
-	"github.com/charmbracelet/glamour/v2"
-
 	"github.com/docker/cagent/pkg/tools/builtin"
+	"github.com/docker/cagent/pkg/tui/components/tool/api"
 	"github.com/docker/cagent/pkg/tui/components/tool/defaulttool"
+	"github.com/docker/cagent/pkg/tui/components/tool/directorytree"
 	"github.com/docker/cagent/pkg/tui/components/tool/editfile"
+	"github.com/docker/cagent/pkg/tui/components/tool/handoff"
+	"github.com/docker/cagent/pkg/tui/components/tool/listdirectory"
 	"github.com/docker/cagent/pkg/tui/components/tool/readfile"
+	"github.com/docker/cagent/pkg/tui/components/tool/readmultiplefiles"
+	"github.com/docker/cagent/pkg/tui/components/tool/searchfilescontent"
+	"github.com/docker/cagent/pkg/tui/components/tool/shell"
 	"github.com/docker/cagent/pkg/tui/components/tool/todotool"
 	"github.com/docker/cagent/pkg/tui/components/tool/transfertask"
 	"github.com/docker/cagent/pkg/tui/components/tool/writefile"
@@ -28,18 +33,22 @@ func NewFactory(registry *Registry) *Factory {
 	}
 }
 
-func (f *Factory) Create(
-	msg *types.Message,
-	renderer *glamour.TermRenderer,
-	sessionState *service.SessionState,
-) layout.Model {
+func (f *Factory) Create(msg *types.Message, sessionState service.SessionStateReader) layout.Model {
 	toolName := msg.ToolCall.Function.Name
 
+	// First try to match by exact tool name
 	if builder, ok := f.registry.Get(toolName); ok {
-		return builder(msg, renderer, sessionState)
+		return builder(msg, sessionState)
 	}
 
-	return defaulttool.New(msg, renderer, sessionState)
+	// Then try to match by category
+	if msg.ToolDefinition.Category != "" {
+		if builder, ok := f.registry.Get("category:" + msg.ToolDefinition.Category); ok {
+			return builder(msg, sessionState)
+		}
+	}
+
+	return defaulttool.New(msg, sessionState)
 }
 
 var (
@@ -50,22 +59,34 @@ var (
 func newDefaultRegistry() *Registry {
 	registry := NewRegistry()
 
-	registry.Register(builtin.ToolNameTransferTask, transfertask.New)
-	registry.Register(builtin.ToolNameEditFile, editfile.New)
-	registry.Register(builtin.ToolNameWriteFile, writefile.New)
-	registry.Register(builtin.ToolNameReadFile, readfile.New)
-	registry.Register(builtin.ToolNameCreateTodo, todotool.New)
-	registry.Register(builtin.ToolNameCreateTodos, todotool.New)
-	registry.Register(builtin.ToolNameUpdateTodo, todotool.New)
-	registry.Register(builtin.ToolNameListTodos, todotool.New)
+	// Define tool registrations declaratively.
+	// Tools with the same visual representation share a builder.
+	registry.RegisterAll([]Registration{
+		{[]string{builtin.ToolNameTransferTask}, transfertask.New},
+		{[]string{builtin.ToolNameHandoff}, handoff.New},
+		{[]string{builtin.ToolNameEditFile}, editfile.New},
+		{[]string{builtin.ToolNameWriteFile}, writefile.New},
+		{[]string{builtin.ToolNameReadFile}, readfile.New},
+		{[]string{builtin.ToolNameReadMultipleFiles}, readmultiplefiles.New},
+		{[]string{builtin.ToolNameListDirectory}, listdirectory.New},
+		{[]string{builtin.ToolNameDirectoryTree}, directorytree.New},
+		{[]string{builtin.ToolNameSearchFilesContent}, searchfilescontent.New},
+		{[]string{builtin.ToolNameShell}, shell.New},
+		{[]string{builtin.ToolNameFetch, "category:api"}, api.New},
+		{
+			[]string{
+				builtin.ToolNameCreateTodo,
+				builtin.ToolNameCreateTodos,
+				builtin.ToolNameUpdateTodos,
+				builtin.ToolNameListTodos,
+			},
+			todotool.New,
+		},
+	})
 
 	return registry
 }
 
-func New(
-	msg *types.Message,
-	renderer *glamour.TermRenderer,
-	sessionState *service.SessionState,
-) layout.Model {
-	return defaultFactory.Create(msg, renderer, sessionState)
+func New(msg *types.Message, sessionState service.SessionStateReader) layout.Model {
+	return defaultFactory.Create(msg, sessionState)
 }

@@ -16,13 +16,13 @@ import (
 )
 
 type GatewayToolset struct {
-	cmdToolset *Toolset
-	cleanUp    func() error
+	*Toolset
+	cleanUp func() error
 }
 
 var _ tools.ToolSet = (*GatewayToolset)(nil)
 
-func NewGatewayToolset(ctx context.Context, mcpServerName string, config any, envProvider environment.Provider) (*GatewayToolset, error) {
+func NewGatewayToolset(ctx context.Context, name, mcpServerName string, config any, envProvider environment.Provider, cwd string) (*GatewayToolset, error) {
 	slog.Debug("Creating MCP Gateway toolset", "name", mcpServerName)
 
 	// Check which secrets (env vars) are required by the MCP server.
@@ -55,42 +55,22 @@ func NewGatewayToolset(ctx context.Context, mcpServerName string, config any, en
 	}
 
 	return &GatewayToolset{
-		cmdToolset: NewToolsetCommand("docker", args, nil),
+		Toolset: NewToolsetCommand(name, "docker", args, nil, cwd),
 		cleanUp: func() error {
 			return errors.Join(os.Remove(fileSecrets), os.Remove(fileConfig))
 		},
 	}, nil
 }
 
-func (t *GatewayToolset) Instructions() string {
-	return t.cmdToolset.Instructions()
-}
-
-func (t *GatewayToolset) Tools(ctx context.Context) ([]tools.Tool, error) {
-	return t.cmdToolset.Tools(ctx)
-}
-
-func (t *GatewayToolset) Start(ctx context.Context) error {
-	return t.cmdToolset.Start(ctx)
-}
-
-func (t *GatewayToolset) SetElicitationHandler(handler tools.ElicitationHandler) {
-	t.cmdToolset.SetElicitationHandler(handler)
-}
-
-func (t *GatewayToolset) SetOAuthSuccessHandler(handler func()) {
-	t.cmdToolset.SetOAuthSuccessHandler(handler)
-}
-
 func (t *GatewayToolset) Stop(ctx context.Context) error {
-	return errors.Join(t.cmdToolset.Stop(ctx), t.cleanUp())
+	return errors.Join(t.Toolset.Stop(ctx), t.cleanUp())
 }
 
 func writeSecretsToFile(ctx context.Context, mcpServerName string, secrets []gateway.Secret, envProvider environment.Provider) (string, error) {
 	var secretValues []string
 	for _, secret := range secrets {
-		v := envProvider.Get(ctx, secret.Env)
-		if v == "" {
+		v, found := envProvider.Get(ctx, secret.Env)
+		if !found || v == "" {
 			return "", errors.New("missing environment variable " + secret.Env + " required by MCP server " + mcpServerName)
 		}
 

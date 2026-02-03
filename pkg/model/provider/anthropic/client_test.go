@@ -321,12 +321,20 @@ func TestCountAnthropicTokens_Success(t *testing.T) {
 
 // TestCountAnthropicTokens_NoAPIKey tests error when API key is missing
 func TestCountAnthropicTokens_NoAPIKey(t *testing.T) {
-	messages := []anthropic.MessageParam{}
-	system := []anthropic.TextBlockParam{}
+	// Use a test server that returns 401 Unauthorized
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error": {"message": "invalid api key"}}`))
+	}))
+	defer server.Close()
+
+	var messages []anthropic.MessageParam
+	var system []anthropic.TextBlockParam
 
 	client := anthropic.NewClient(
-		option.WithAPIKey("test-key"),
-		// No base URL set
+		option.WithAPIKey("invalid-key"),
+		option.WithBaseURL(server.URL),
+		option.WithMaxRetries(0), // Disable retries to speed up test
 	)
 
 	tokens, err := countAnthropicTokens(t.Context(), client, "claude-3-5-sonnet-20241022", messages, system, nil)
@@ -342,12 +350,13 @@ func TestCountAnthropicTokens_ServerError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	messages := []anthropic.MessageParam{}
-	system := []anthropic.TextBlockParam{}
+	var messages []anthropic.MessageParam
+	var system []anthropic.TextBlockParam
 
 	client := anthropic.NewClient(
 		option.WithAPIKey("test-key"),
 		option.WithBaseURL(server.URL),
+		option.WithMaxRetries(0), // Disable retries to speed up test
 	)
 
 	tokens, err := countAnthropicTokens(t.Context(), client, "claude-3-5-sonnet-20241022", messages, system, nil)
@@ -374,8 +383,8 @@ func TestCountAnthropicTokens_WithTools(t *testing.T) {
 	}))
 	defer server.Close()
 
-	messages := []anthropic.MessageParam{}
-	system := []anthropic.TextBlockParam{}
+	var messages []anthropic.MessageParam
+	var system []anthropic.TextBlockParam
 	aiTools := []anthropic.ToolUnionParam{
 		{OfTool: &anthropic.ToolParam{
 			Name:        "test_tool",
@@ -469,4 +478,46 @@ func TestExtractSystemBlocks_MultiContent(t *testing.T) {
 	require.Len(t, blocks, 2)
 	assert.Equal(t, "Part 1", blocks[0].Text)
 	assert.Equal(t, "Part 2", blocks[1].Text)
+}
+
+func TestExtractSystemBlocksCacheControl(t *testing.T) {
+	msgs := []chat.Message{
+		{
+			Role:    chat.MessageRoleSystem,
+			Content: "instructions",
+		},
+		{
+			Role:         chat.MessageRoleSystem,
+			Content:      "tools",
+			CacheControl: true,
+		},
+		{
+			Role:    chat.MessageRoleSystem,
+			Content: "date",
+		},
+		{
+			Role:         chat.MessageRoleSystem,
+			Content:      "last",
+			CacheControl: true,
+		},
+	}
+
+	blocks := extractSystemBlocks(msgs)
+
+	require.Len(t, blocks, 4)
+	assert.Equal(t, "instructions", blocks[0].Text)
+	assert.Empty(t, string(blocks[0].CacheControl.Type))
+	assert.Empty(t, string(blocks[0].CacheControl.TTL))
+
+	assert.Equal(t, "tools", blocks[1].Text)
+	assert.Equal(t, "ephemeral", string(blocks[1].CacheControl.Type))
+	assert.Empty(t, string(blocks[1].CacheControl.TTL))
+
+	assert.Equal(t, "date", blocks[2].Text)
+	assert.Empty(t, string(blocks[2].CacheControl.Type))
+	assert.Empty(t, string(blocks[2].CacheControl.TTL))
+
+	assert.Equal(t, "last", blocks[3].Text)
+	assert.Equal(t, "ephemeral", string(blocks[3].CacheControl.Type))
+	assert.Empty(t, string(blocks[3].CacheControl.TTL))
 }

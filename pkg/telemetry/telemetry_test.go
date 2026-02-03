@@ -12,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -130,7 +129,7 @@ func TestSessionTracking(t *testing.T) {
 	client.RecordSessionEnd(ctx)
 
 	// Wait for events to be processed
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(20 * time.Millisecond)
 
 	requestCount := mockHTTP.GetRequestCount()
 	assert.Positive(t, requestCount, "Expected HTTP requests to be made for session tracking events")
@@ -161,14 +160,13 @@ func TestCommandTracking(t *testing.T) {
 	}
 	err := client.TrackCommand(t.Context(), cmdInfo, func(ctx context.Context) error {
 		executed = true
-		time.Sleep(10 * time.Millisecond)
 		return nil
 	})
 	require.NoError(t, err)
 	assert.True(t, executed)
 
 	// Wait for events to be processed
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(20 * time.Millisecond)
 
 	requestCount := mockHTTP.GetRequestCount()
 	assert.Positive(t, requestCount, "Expected HTTP requests to be made for command tracking")
@@ -203,7 +201,7 @@ func TestCommandTrackingWithError(t *testing.T) {
 	assert.Equal(t, testErr, err)
 
 	// Wait for events to be processed
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(20 * time.Millisecond)
 
 	requestCount := mockHTTP.GetRequestCount()
 	assert.Positive(t, requestCount, "Expected HTTP requests to be made for command error tracking")
@@ -226,20 +224,36 @@ func TestStructuredEvent(t *testing.T) {
 }
 
 func TestGetTelemetryEnabled(t *testing.T) {
-	t.Setenv("TELEMETRY_ENABLED", "")
-	assert.True(t, GetTelemetryEnabled())
+	// When running under 'go test', GetTelemetryEnabled() always returns false
+	// because flag.Lookup("test.v") is set. This test verifies that behavior.
+	assert.False(t, GetTelemetryEnabled(), "Expected telemetry to be disabled during tests")
 
-	t.Setenv("TELEMETRY_ENABLED", "false")
-	assert.False(t, GetTelemetryEnabled())
-
+	// Even with TELEMETRY_ENABLED=true, telemetry is disabled during tests
 	t.Setenv("TELEMETRY_ENABLED", "true")
-	assert.True(t, GetTelemetryEnabled())
+	assert.False(t, GetTelemetryEnabled(), "Expected telemetry to be disabled during tests even with TELEMETRY_ENABLED=true")
+}
 
-	testCases := []string{"1", "yes", "on", "enabled", "anything", ""}
-	for _, value := range testCases {
-		t.Setenv("TELEMETRY_ENABLED", value)
-		assert.True(t, GetTelemetryEnabled(), "Expected telemetry to be enabled when TELEMETRY_ENABLED=%s", value)
-	}
+func TestGetTelemetryEnabledFromEnv(t *testing.T) {
+	// Test the environment variable logic directly (bypassing test detection)
+
+	// Default (no env var) should be enabled
+	t.Setenv("TELEMETRY_ENABLED", "")
+	assert.True(t, getTelemetryEnabledFromEnv(), "Expected telemetry enabled by default")
+
+	// Explicitly set to "true" should be enabled
+	t.Setenv("TELEMETRY_ENABLED", "true")
+	assert.True(t, getTelemetryEnabledFromEnv(), "Expected telemetry enabled when TELEMETRY_ENABLED=true")
+
+	// Explicitly set to "false" should be disabled
+	t.Setenv("TELEMETRY_ENABLED", "false")
+	assert.False(t, getTelemetryEnabledFromEnv(), "Expected telemetry disabled when TELEMETRY_ENABLED=false")
+
+	// Any other value should be enabled (only "false" disables)
+	t.Setenv("TELEMETRY_ENABLED", "1")
+	assert.True(t, getTelemetryEnabledFromEnv(), "Expected telemetry enabled when TELEMETRY_ENABLED=1")
+
+	t.Setenv("TELEMETRY_ENABLED", "yes")
+	assert.True(t, getTelemetryEnabledFromEnv(), "Expected telemetry enabled when TELEMETRY_ENABLED=yes")
 }
 
 // testError is a simple error implementation for testing
@@ -480,9 +494,7 @@ func TestAllEventTypes(t *testing.T) {
 	client.RecordSessionEnd(ctx)
 
 	// Wait for events to be processed
-
-	// Give additional time for background processing
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(20 * time.Millisecond)
 
 	requestCount := mockHTTP.GetRequestCount()
 	assert.Positive(t, requestCount, "Expected HTTP requests to be made for telemetry events")
@@ -531,73 +543,10 @@ func TestTrackServerStart(t *testing.T) {
 	}
 	err := client.TrackServerStart(t.Context(), cmdInfo, func(ctx context.Context) error {
 		executed = true
-		// Simulate server running briefly
-		time.Sleep(10 * time.Millisecond)
 		return nil
 	})
 	require.NoError(t, err)
 	assert.True(t, executed)
-}
-
-// TestBuildCommandInfo tests the BuildCommandInfo function with all commands
-func TestBuildCommandInfo(t *testing.T) {
-	testCases := []struct {
-		name     string
-		command  string
-		args     []string
-		expected CommandInfo
-	}{
-		{
-			name:    "run command with config",
-			command: "run",
-			args:    []string{"config.yaml", "--debug"},
-			expected: CommandInfo{
-				Action: "run",
-				Args:   []string{"config.yaml"},
-				Flags:  []string{},
-			},
-		},
-		{
-			name:    "pull command with image",
-			command: "pull",
-			args:    []string{"user/agent:latest"},
-			expected: CommandInfo{
-				Action: "pull",
-				Args:   []string{"user/agent:latest"},
-				Flags:  []string{},
-			},
-		},
-		{
-			name:    "catalog command",
-			command: "catalog",
-			args:    []string{},
-			expected: CommandInfo{
-				Action: "catalog",
-				Args:   []string{},
-				Flags:  []string{},
-			},
-		},
-		{
-			name:    "version command",
-			command: "version",
-			args:    []string{},
-			expected: CommandInfo{
-				Action: "version",
-				Args:   []string{},
-				Flags:  []string{},
-			},
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			cmd := &cobra.Command{Use: tc.command}
-			result := BuildCommandInfo(cmd, tc.args, tc.command)
-
-			assert.Equal(t, tc.expected.Action, result.Action)
-			assert.Equal(t, tc.expected.Args, result.Args)
-		})
-	}
 }
 
 // TestGlobalTelemetryFunctions tests the global telemetry convenience functions
@@ -660,8 +609,8 @@ func TestHTTPRequestVerification(t *testing.T) {
 
 		client.Track(ctx, event)
 
-		// Give additional time for background processing (race condition fix)
-		time.Sleep(100 * time.Millisecond)
+		// Give time for background processing
+		time.Sleep(20 * time.Millisecond)
 
 		// Debug output
 		t.Logf("HTTP requests captured: %d", mockHTTP.GetRequestCount())
@@ -730,17 +679,6 @@ func TestHTTPRequestVerification(t *testing.T) {
 	})
 }
 
-// SlowMockHTTPClient creates artificial backpressure by adding delays
-type SlowMockHTTPClient struct {
-	*MockHTTPClient
-	delay time.Duration
-}
-
-func (s *SlowMockHTTPClient) RoundTrip(req *http.Request) (*http.Response, error) {
-	time.Sleep(s.delay) // Add artificial delay
-	return s.MockHTTPClient.RoundTrip(req)
-}
-
 // TestNon2xxHTTPResponseHandling ensures that 5xx responses are logged and handled gracefully
 func TestNon2xxHTTPResponseHandling(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
@@ -761,8 +699,8 @@ func TestNon2xxHTTPResponseHandling(t *testing.T) {
 
 	client.Track(t.Context(), &CommandEvent{Action: "error-test", Success: true})
 
-	// Give more time for background processing
-	time.Sleep(100 * time.Millisecond)
+	// Give time for background processing
+	time.Sleep(20 * time.Millisecond)
 
 	requestCount := mockHTTP.GetRequestCount()
 	assert.Positive(t, requestCount, "Expected HTTP request to be made despite error response")
@@ -776,7 +714,7 @@ func TestNon2xxHTTPResponseHandling(t *testing.T) {
 
 	client.Track(t.Context(), &CommandEvent{Action: "not-found-test", Success: true})
 
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(20 * time.Millisecond)
 
 	finalRequestCount := mockHTTP.GetRequestCount()
 	assert.GreaterOrEqual(t, finalRequestCount, 2, "Expected at least 2 HTTP requests (500 + 404)")

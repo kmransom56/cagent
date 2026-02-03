@@ -1,7 +1,6 @@
 package config
 
 import (
-	"os"
 	"path/filepath"
 	"testing"
 
@@ -9,27 +8,8 @@ import (
 )
 
 func TestLoadConfig_InvalidPath(t *testing.T) {
-	tmp := openRoot(t, t.TempDir())
-
-	validConfig := `version: 1
-agents:
-  root:
-    model: "openai/gpt-4"
-`
-
-	err := tmp.WriteFile("valid.yaml", []byte(validConfig), 0o644)
-	require.NoError(t, err)
-
-	cfg, err := LoadConfig("valid.yaml", tmp)
-	require.NoError(t, err)
-	require.NotNil(t, cfg)
-
-	_, err = LoadConfig("../../../etc/passwd", tmp)
-	require.Error(t, err)
-}
-
-func TestLoadConfigSecureDeprecated_InvalidPath(t *testing.T) {
 	tmp := t.TempDir()
+	tmpRoot := openRoot(t, tmp)
 
 	validConfig := `version: 1
 agents:
@@ -37,18 +17,20 @@ agents:
     model: "openai/gpt-4"
 `
 
-	err := os.WriteFile(filepath.Join(tmp, "valid.yaml"), []byte(validConfig), 0o644)
+	err := tmpRoot.WriteFile("valid.yaml", []byte(validConfig), 0o644)
 	require.NoError(t, err)
 
-	cfg, err := LoadConfigSecureDeprecated("valid.yaml", tmp)
+	cfg, err := Load(t.Context(), testfileSource(filepath.Join(tmp, "valid.yaml")))
 	require.NoError(t, err)
 	require.NotNil(t, cfg)
 
-	_, err = LoadConfigSecureDeprecated("../../../etc/passwd", tmp)
+	_, err = Load(t.Context(), testfileSource(filepath.Join(tmp, "../../../etc/passwd"))) //nolint: gocritic // testing invalid path
 	require.Error(t, err)
 }
 
 func TestValidationErrors(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name string
 		path string
@@ -65,16 +47,58 @@ func TestValidationErrors(t *testing.T) {
 			name: "post_edit in non filesystem toolset",
 			path: "invalid_post_edit_v2.yaml",
 		},
+		{
+			name: "skills enabled without filesystem toolset",
+			path: "skills_missing_filesystem.yaml",
+		},
+		{
+			name: "skills enabled without read_file tool",
+			path: "skills_missing_read_file.yaml",
+		},
+		{
+			name: "lsp toolset missing command",
+			path: "invalid_lsp_missing_command.yaml",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			root := openRoot(t, "testdata")
-
-			_, err := LoadConfig(tt.path, root)
+			_, err := Load(t.Context(), testfileSource(filepath.Join("testdata", tt.path)))
 			require.Error(t, err)
+		})
+	}
+}
+
+func TestValidSkillsConfiguration(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		path string
+	}{
+		{
+			name: "skills with all filesystem tools",
+			path: "skills_valid_all_tools.yaml",
+		},
+		{
+			name: "skills with explicit read_file tool",
+			path: "skills_valid_explicit_tools.yaml",
+		},
+		{
+			name: "skills disabled",
+			path: "skills_disabled.yaml",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg, err := Load(t.Context(), testfileSource(filepath.Join("testdata", tt.path)))
+			require.NoError(t, err)
+			require.NotNil(t, cfg)
 		})
 	}
 }

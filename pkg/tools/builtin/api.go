@@ -2,6 +2,7 @@ package builtin
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -10,35 +11,30 @@ import (
 	"net/url"
 	"time"
 
-	latest "github.com/docker/cagent/pkg/config/v2"
+	"github.com/docker/cagent/pkg/config/latest"
 	"github.com/docker/cagent/pkg/js"
 	"github.com/docker/cagent/pkg/tools"
-)
-
-const (
-	ToolNameAPI = "api"
+	"github.com/docker/cagent/pkg/useragent"
 )
 
 type APITool struct {
-	tools.ElicitationTool
-	handler *apiHandler
-	config  latest.APIToolConfig
-}
-
-var _ tools.ToolSet = (*APITool)(nil)
-
-type apiHandler struct {
 	config latest.APIToolConfig
 }
 
-func (h *apiHandler) CallTool(ctx context.Context, toolCall tools.ToolCall) (*tools.ToolCallResult, error) {
+// Verify interface compliance
+var (
+	_ tools.ToolSet      = (*APITool)(nil)
+	_ tools.Instructable = (*APITool)(nil)
+)
+
+func (t *APITool) callTool(ctx context.Context, toolCall tools.ToolCall) (*tools.ToolCallResult, error) {
 	client := &http.Client{
 		Timeout: 30 * time.Second,
 	}
 
-	endpoint := h.config.Endpoint
+	endpoint := t.config.Endpoint
 	var reqBody io.Reader = http.NoBody
-	switch h.config.Method {
+	switch t.config.Method {
 	case http.MethodGet:
 		if toolCall.Function.Arguments != "" {
 			var params map[string]string
@@ -65,17 +61,17 @@ func (h *apiHandler) CallTool(ctx context.Context, toolCall tools.ToolCall) (*to
 		reqBody = bytes.NewReader(jsonData)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, h.config.Method, endpoint, reqBody)
+	req, err := http.NewRequestWithContext(ctx, t.config.Method, endpoint, reqBody)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %v", err)
 	}
 
-	req.Header.Set("User-Agent", userAgent)
-	if h.config.Method == http.MethodPost {
+	req.Header.Set("User-Agent", useragent.Header)
+	if t.config.Method == http.MethodPost {
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	for key, value := range h.config.Headers {
+	for key, value := range t.config.Headers {
 		req.Header.Set(key, value)
 	}
 
@@ -91,17 +87,12 @@ func (h *apiHandler) CallTool(ctx context.Context, toolCall tools.ToolCall) (*to
 		return nil, fmt.Errorf("failed to read response body: %v", err)
 	}
 
-	return &tools.ToolCallResult{Output: string(body)}, nil
+	return tools.ResultSuccess(limitOutput(string(body))), nil
 }
-
-type APIToolOption func(*APITool)
 
 func NewAPITool(config latest.APIToolConfig) *APITool {
 	return &APITool{
 		config: config,
-		handler: &apiHandler{
-			config: config,
-		},
 	}
 }
 
@@ -132,26 +123,27 @@ func (t *APITool) Tools(context.Context) ([]tools.Tool, error) {
 		return nil, fmt.Errorf("only HTTP and HTTPS URLs are supported")
 	}
 
+	outputSchema := tools.MustSchemaFor[string]()
+	if t.config.OutputSchema != nil {
+		var err error
+		outputSchema, err = tools.SchemaToMap(t.config.OutputSchema)
+		if err != nil {
+			return nil, fmt.Errorf("invalid output_schema: %w", err)
+		}
+	}
+
 	return []tools.Tool{
 		{
 			Name:         t.config.Name,
 			Category:     "api",
 			Description:  t.config.Instruction,
 			Parameters:   inputSchema,
-			OutputSchema: tools.MustSchemaFor[string](),
-			Handler:      t.handler.CallTool,
+			OutputSchema: outputSchema,
+			Handler:      t.callTool,
 			Annotations: tools.ToolAnnotations{
 				ReadOnlyHint: true,
-				Title:        "API URLs",
+				Title:        cmp.Or(t.config.Name, "Query API"),
 			},
 		},
 	}, nil
-}
-
-func (t *APITool) Start(context.Context) error {
-	return nil
-}
-
-func (t *APITool) Stop(context.Context) error {
-	return nil
 }

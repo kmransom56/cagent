@@ -1,26 +1,128 @@
 package service
 
+import (
+	"github.com/docker/cagent/pkg/runtime"
+	"github.com/docker/cagent/pkg/session"
+	"github.com/docker/cagent/pkg/tui/types"
+)
+
+// SessionStateReader provides read-only access to session state.
+// Components that only need to read state should depend on this interface
+// rather than the full SessionState, following the principle of least privilege.
+type SessionStateReader interface {
+	SplitDiffView() bool
+	YoloMode() bool
+	Thinking() bool
+	HideToolResults() bool
+	CurrentAgentName() string
+	PreviousMessage() *types.Message
+	SessionTitle() string
+	AvailableAgents() []runtime.AgentDetails
+	GetCurrentAgent() runtime.AgentDetails
+}
+
+// Verify SessionState implements SessionStateReader
+var _ SessionStateReader = (*SessionState)(nil)
+
 // SessionState holds shared state across the TUI application.
 // This provides a centralized location for state that needs to be
 // accessible by multiple components.
 type SessionState struct {
-	// TodoManager manages the state of all todos across the application
-	TodoManager *TodoManager
+	splitDiffView   bool
+	yoloMode        bool
+	thinking        bool
+	hideToolResults bool
+	sessionTitle    string
 
-	// SplitDiffView determines whether diff views should be shown side-by-side (true)
-	// or unified (false)
-	SplitDiffView bool
+	previousMessage  *types.Message
+	currentAgentName string
+	availableAgents  []runtime.AgentDetails
 }
 
-// NewSessionState creates a new SessionState with default values.
-func NewSessionState() *SessionState {
+func NewSessionState(s *session.Session) *SessionState {
 	return &SessionState{
-		TodoManager:   NewTodoManager(),
-		SplitDiffView: true, // Default to split view
+		splitDiffView:   true,
+		yoloMode:        s.ToolsApproved,
+		thinking:        s.Thinking,
+		hideToolResults: s.HideToolResults,
+		sessionTitle:    s.Title,
 	}
 }
 
-// ToggleSplitDiffView toggles between split and unified diff view modes.
+func (s *SessionState) SplitDiffView() bool {
+	return s.splitDiffView
+}
+
 func (s *SessionState) ToggleSplitDiffView() {
-	s.SplitDiffView = !s.SplitDiffView
+	s.splitDiffView = !s.splitDiffView
+}
+
+func (s *SessionState) YoloMode() bool {
+	return s.yoloMode
+}
+
+func (s *SessionState) SetYoloMode(yoloMode bool) {
+	s.yoloMode = yoloMode
+}
+
+func (s *SessionState) Thinking() bool {
+	return s.thinking
+}
+
+func (s *SessionState) SetThinking(thinking bool) {
+	s.thinking = thinking
+}
+
+func (s *SessionState) HideToolResults() bool {
+	return s.hideToolResults
+}
+
+func (s *SessionState) ToggleHideToolResults() {
+	s.hideToolResults = !s.hideToolResults
+}
+
+func (s *SessionState) SetHideToolResults(hideToolResults bool) {
+	s.hideToolResults = hideToolResults
+}
+
+func (s *SessionState) CurrentAgentName() string {
+	return s.currentAgentName
+}
+
+func (s *SessionState) SetCurrentAgentName(currentAgentName string) {
+	s.currentAgentName = currentAgentName
+}
+
+func (s *SessionState) PreviousMessage() *types.Message {
+	return s.previousMessage
+}
+
+func (s *SessionState) SetPreviousMessage(previousMessage *types.Message) {
+	s.previousMessage = previousMessage
+}
+
+func (s *SessionState) SessionTitle() string {
+	return s.sessionTitle
+}
+
+func (s *SessionState) SetSessionTitle(sessionTitle string) {
+	s.sessionTitle = sessionTitle
+}
+
+func (s *SessionState) AvailableAgents() []runtime.AgentDetails {
+	return s.availableAgents
+}
+
+func (s *SessionState) SetAvailableAgents(availableAgents []runtime.AgentDetails) {
+	s.availableAgents = availableAgents
+}
+
+func (s *SessionState) GetCurrentAgent() runtime.AgentDetails {
+	for _, agent := range s.availableAgents {
+		if agent.Name == s.currentAgentName {
+			return agent
+		}
+	}
+
+	return runtime.AgentDetails{}
 }

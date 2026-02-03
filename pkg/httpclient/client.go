@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
+	"net/url"
 	"runtime"
 
 	"github.com/docker/cagent/pkg/version"
@@ -11,6 +12,7 @@ import (
 
 type HTTPOptions struct {
 	Header http.Header
+	Query  url.Values
 }
 
 type Opt func(*HTTPOptions)
@@ -41,6 +43,14 @@ func WithHeader(key, value string) Opt {
 	}
 }
 
+func WithHeaders(headers map[string]string) Opt {
+	return func(o *HTTPOptions) {
+		for k, v := range headers {
+			o.Header.Add(k, v)
+		}
+	}
+}
+
 func WithProxiedBaseURL(value string) Opt {
 	return func(o *HTTPOptions) {
 		o.Header.Set("X-Cagent-Forward", value)
@@ -66,6 +76,12 @@ func WithModel(model string) Opt {
 	}
 }
 
+func WithQuery(query url.Values) Opt {
+	return func(o *HTTPOptions) {
+		o.Query = query
+	}
+}
+
 type userAgentTransport struct {
 	httpOptions HTTPOptions
 	rt          http.RoundTripper
@@ -74,5 +90,16 @@ type userAgentTransport struct {
 func (u *userAgentTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	r2 := req.Clone(req.Context())
 	maps.Copy(r2.Header, u.httpOptions.Header)
+
+	if u.httpOptions.Query != nil {
+		q := r2.URL.Query()
+		for k, vs := range u.httpOptions.Query {
+			for _, v := range vs {
+				q.Add(k, v)
+			}
+		}
+		r2.URL.RawQuery = q.Encode()
+	}
+
 	return u.rt.RoundTrip(r2)
 }

@@ -3,24 +3,24 @@ package root
 import (
 	"github.com/spf13/cobra"
 
+	"github.com/docker/cagent/pkg/build"
 	"github.com/docker/cagent/pkg/cli"
-	"github.com/docker/cagent/pkg/filesystem"
-	"github.com/docker/cagent/pkg/oci"
 	"github.com/docker/cagent/pkg/telemetry"
 )
 
 type buildFlags struct {
-	opts oci.Options
+	opts build.Options
 }
 
 func newBuildCmd() *cobra.Command {
 	var flags buildFlags
 
 	cmd := &cobra.Command{
-		Use:   "build <agent-file> [docker-image-name]",
-		Short: "Build a Docker image for the agent",
-		Args:  cobra.RangeArgs(1, 2),
-		RunE:  flags.runBuildCommand,
+		Use:     "build <agent-file>|<registry-ref> [docker-image-name]",
+		Short:   "Build a Docker image for the agent",
+		Args:    cobra.RangeArgs(1, 2),
+		GroupID: "advanced",
+		RunE:    flags.runBuildCommand,
 	}
 
 	cmd.PersistentFlags().BoolVar(&flags.opts.DryRun, "dry-run", false, "only print the generated Dockerfile")
@@ -35,13 +35,13 @@ func (f *buildFlags) runBuildCommand(cmd *cobra.Command, args []string) error {
 	telemetry.TrackCommand("build", args)
 
 	ctx := cmd.Context()
+	agentFilename := args[0]
 	out := cli.NewPrinter(cmd.OutOrStdout())
 
-	agentFilePath := args[0]
 	dockerImageName := ""
 	if len(args) > 1 {
 		dockerImageName = args[1]
 	}
 
-	return oci.BuildDockerImage(ctx, out, agentFilePath, filesystem.AllowAll, dockerImageName, f.opts)
+	return build.DockerImage(ctx, out, agentFilename, dockerImageName, f.opts)
 }

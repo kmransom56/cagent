@@ -1,9 +1,12 @@
 package styles
 
 import (
+	"image/color"
 	"strings"
+	"time"
 
 	"charm.land/bubbles/v2/textarea"
+	"charm.land/bubbles/v2/textinput"
 	"charm.land/lipgloss/v2"
 	"github.com/alecthomas/chroma/v2"
 	"github.com/charmbracelet/glamour/v2/ansi"
@@ -14,138 +17,93 @@ const (
 	defaultMargin     = 2
 )
 
-// Color hex values (used throughout the file)
-const (
-	// Primary colors
-	ColorAccentBlue      = "#7AA2F7" // Soft blue
-	ColorMutedBlue       = "#565F89" // Dark blue-grey
-	ColorBackgroundAlt   = "#24283B" // Slightly lighter background
-	ColorBorderSecondary = "#414868" // Dark blue-grey
-	ColorTextPrimary     = "#C0CAF5" // Light blue-white
-	ColorTextSecondary   = "#9AA5CE" // Medium blue-grey
-	ColorSuccessGreen    = "#9ECE6A" // Soft green
-	ColorErrorRed        = "#F7768E" // Soft red
-	ColorWarningYellow   = "#E0AF68" // Soft yellow
-
-	// Background colors
-	ColorBackground = "#1A1B26" // Dark blue-black
-
-	// Status colors
-	ColorInfoCyan = "#7DCFFF" // Soft cyan
-
-	// Diff colors
-	ColorDiffAddBg    = "#20303B" // Dark blue-green
-	ColorDiffRemoveBg = "#3C2A2A" // Dark red-brown
-
-	// Line number and UI element colors
-	ColorLineNumber = "#565F89" // Muted blue-grey (same as ColorMutedBlue)
-	ColorSeparator  = "#414868" // Dark blue-grey (same as ColorBorderSecondary)
-
-	// Word-level diff highlight colors (visible but not harsh)
-	ColorDiffWordAddBg    = "#2D4F3F" // Medium dark teal with green tint
-	ColorDiffWordRemoveBg = "#4F2D3A" // Medium dark burgundy with red tint
-
-	// Interactive element colors
-	ColorSelected = "#364A82" // Dark blue for selected items
-	ColorHover    = "#2D3F5F" // Slightly lighter than selected
-)
-
-// Chroma syntax highlighting colors (Monokai theme)
-const (
-	ChromaErrorFgColor             = "#F1F1F1"
-	ChromaSuccessColor             = "#00D787"
-	ChromaErrorBgColor             = "#F05B5B"
-	ChromaCommentColor             = "#676767"
-	ChromaCommentPreprocColor      = "#FF875F"
-	ChromaKeywordColor             = "#00AAFF"
-	ChromaKeywordReservedColor     = "#FF5FD2"
-	ChromaKeywordNamespaceColor    = "#FF5F87"
-	ChromaKeywordTypeColor         = "#6E6ED8"
-	ChromaOperatorColor            = "#EF8080"
-	ChromaPunctuationColor         = "#E8E8A8"
-	ChromaNameBuiltinColor         = "#FF8EC7"
-	ChromaNameTagColor             = "#B083EA"
-	ChromaNameAttributeColor       = "#7A7AE6"
-	ChromaNameDecoratorColor       = "#FFFF87"
-	ChromaLiteralNumberColor       = "#6EEFC0"
-	ChromaLiteralStringColor       = "#C69669"
-	ChromaLiteralStringEscapeColor = "#AFFFD7"
-	ChromaGenericDeletedColor      = "#FD5B5B"
-	ChromaGenericSubheadingColor   = "#777777"
-	ChromaBackgroundColor          = "#373737"
-)
-
-// ANSI color codes (8-bit color codes)
-const (
-	ANSIColor252 = "252"
-	ANSIColor39  = "39"
-	ANSIColor63  = "63"
-	ANSIColor35  = "35"
-	ANSIColor212 = "212"
-	ANSIColor243 = "243"
-	ANSIColor244 = "244"
-)
-
-// Tokyo Night-inspired Color Palette
+// Color variables - initialized by ApplyTheme() before TUI starts.
+// These are set from the theme's YAML values (see themes/default.yaml for defaults).
 var (
 	// Background colors
-	Background    = lipgloss.Color(ColorBackground)
-	BackgroundAlt = lipgloss.Color(ColorBackgroundAlt)
+	Background    color.Color
+	BackgroundAlt color.Color
 
 	// Primary accent colors
-	Accent    = lipgloss.Color(ColorAccentBlue)
-	AccentDim = lipgloss.Color(ColorMutedBlue)
+	White    color.Color
+	MobyBlue color.Color
+	Accent   color.Color
 
-	// Status colors - softer, more professional
-	Success = lipgloss.Color(ColorSuccessGreen)
-	Error   = lipgloss.Color(ColorErrorRed)
-	Warning = lipgloss.Color(ColorWarningYellow)
-	Info    = lipgloss.Color(ColorInfoCyan)
+	// Status colors
+	Success   color.Color
+	Error     color.Color
+	Warning   color.Color
+	Info      color.Color
+	Highlight color.Color
 
 	// Text hierarchy
-	TextPrimary   = lipgloss.Color(ColorTextPrimary)
-	TextSecondary = lipgloss.Color(ColorTextSecondary)
-	TextMuted     = lipgloss.Color(ColorMutedBlue)
-	TextSubtle    = lipgloss.Color(ColorBorderSecondary)
+	TextPrimary   color.Color
+	TextSecondary color.Color
+	TextMuted     color.Color
+	TextMutedGray color.Color
 
 	// Border colors
-	BorderPrimary   = lipgloss.Color(ColorAccentBlue)
-	BorderSecondary = lipgloss.Color(ColorBorderSecondary)
-	BorderMuted     = lipgloss.Color(ColorBackgroundAlt)
-	BorderWarning   = lipgloss.Color(ColorWarningYellow)
-	BorderError     = lipgloss.Color(ColorErrorRed)
+	BorderPrimary   color.Color
+	BorderSecondary color.Color
+	BorderMuted     color.Color
+	BorderWarning   color.Color
 
-	// Diff colors (matching glamour/markdown "dark" theme)
-	DiffAddBg    = lipgloss.Color(ColorDiffAddBg)
-	DiffRemoveBg = lipgloss.Color(ColorDiffRemoveBg)
-	DiffAddFg    = lipgloss.Color(ColorSuccessGreen)
-	DiffRemoveFg = lipgloss.Color(ColorErrorRed)
+	// Diff colors
+	DiffAddBg    color.Color
+	DiffRemoveBg color.Color
+	DiffAddFg    color.Color
+	DiffRemoveFg color.Color
 
 	// UI element colors
-	LineNumber = lipgloss.Color(ColorLineNumber)
-	Separator  = lipgloss.Color(ColorSeparator)
+	LineNumber color.Color
+	Separator  color.Color
 
 	// Interactive element colors
-	Selected         = lipgloss.Color(ColorSelected)
-	SelectedFg       = lipgloss.Color(ColorTextPrimary)
-	Hover            = lipgloss.Color(ColorHover)
-	PlaceholderColor = lipgloss.Color(ColorMutedBlue)
+	Selected         color.Color
+	SelectedFg       color.Color
+	PlaceholderColor color.Color
+
+	// Badge colors
+	AgentBadgeFg color.Color
+	AgentBadgeBg color.Color
+	BadgePurple  color.Color
+	BadgeCyan    color.Color
+	BadgeGreen   color.Color
+
+	// Error colors (extended)
+	ErrorStrong color.Color
+	ErrorDark   color.Color
+
+	// Additional muted colors
+	FadedGray color.Color
+
+	// Tabs
+	TabBg        color.Color
+	TabPrimaryFg color.Color
+	TabAccentFg  color.Color
 )
 
 // Base Styles
+const (
+	AppPaddingLeft = 1 // Keep in sync with AppStyle padding
+
+	// DoubleClickThreshold is the maximum time between clicks to register as a double-click
+	DoubleClickThreshold = 400 * time.Millisecond
+)
+
 var (
-	BaseStyle = lipgloss.NewStyle().Foreground(TextPrimary)
-	AppStyle  = BaseStyle.Padding(0, 1, 0, 1)
+	NoStyle   = lipgloss.NewStyle()
+	BaseStyle = NoStyle.Foreground(TextPrimary)
+	AppStyle  = BaseStyle.Padding(0, 1, 0, AppPaddingLeft)
 )
 
 // Text Styles
 var (
-	HighlightStyle = BaseStyle.Foreground(Accent)
-	MutedStyle     = BaseStyle.Foreground(TextMuted)
-	SubtleStyle    = BaseStyle.Foreground(TextSubtle)
-	SecondaryStyle = BaseStyle.Foreground(TextSecondary)
-	BoldStyle      = BaseStyle.Bold(true)
-	ItalicStyle    = BaseStyle.Italic(true)
+	HighlightWhiteStyle = BaseStyle.Foreground(White).Bold(true)
+	MutedStyle          = BaseStyle.Foreground(TextMutedGray)
+	SecondaryStyle      = BaseStyle.Foreground(TextSecondary)
+	BoldStyle           = BaseStyle.Bold(true)
+	FadingStyle         = NoStyle.Foreground(FadedGray) // Very dim for fade-out animations (rebuilt by ApplyTheme)
 )
 
 // Status Styles
@@ -155,40 +113,45 @@ var (
 	WarningStyle    = BaseStyle.Foreground(Warning)
 	InfoStyle       = BaseStyle.Foreground(Info)
 	ActiveStyle     = BaseStyle.Foreground(Success)
-	InProgressStyle = BaseStyle.Foreground(Warning)
-	PendingStyle    = BaseStyle.Foreground(TextSecondary)
+	ToBeDoneStyle   = BaseStyle.Foreground(TextPrimary)
+	InProgressStyle = BaseStyle.Foreground(Highlight)
+	CompletedStyle  = BaseStyle.Foreground(TextMutedGray)
 )
 
 // Layout Styles
 var (
-	HeaderStyle        = BaseStyle.Foreground(Accent).Padding(0, 0, 1, 0)
-	PaddedContentStyle = BaseStyle.Padding(1, 2)
-	CenterStyle        = BaseStyle.Align(lipgloss.Center, lipgloss.Center)
+	CenterStyle = BaseStyle.Align(lipgloss.Center, lipgloss.Center)
 )
 
 // Border Styles
 var (
-	BorderStyle = BaseStyle.
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(BorderPrimary)
-
-	BorderedBoxStyle = BaseStyle.
-				Border(lipgloss.RoundedBorder()).
-				BorderForeground(BorderSecondary).
-				Padding(0, 1)
-
-	BorderedBoxFocusedStyle = BaseStyle.
-				Border(lipgloss.RoundedBorder()).
-				BorderForeground(BorderPrimary).
-				Padding(0, 1)
-
-	UserMessageBorderStyle = BaseStyle.
-				Padding(1, 2).
+	BaseMessageStyle = BaseStyle.
+				Padding(1, 1).
 				BorderLeft(true).
+				BorderStyle(lipgloss.HiddenBorder()).
+				BorderForeground(BorderPrimary)
+
+	UserMessageStyle = BaseMessageStyle.
 				BorderStyle(lipgloss.ThickBorder()).
 				BorderForeground(BorderPrimary).
-				Bold(true).
-				Background(BackgroundAlt)
+				Foreground(TextPrimary).
+				Background(BackgroundAlt).
+				Bold(true)
+
+	AssistantMessageStyle = BaseMessageStyle.
+				Padding(0, 1)
+
+	WelcomeMessageStyle = BaseMessageStyle.
+				BorderStyle(lipgloss.DoubleBorder()).
+				Bold(true)
+
+	ErrorMessageStyle = BaseMessageStyle.
+				BorderStyle(lipgloss.ThickBorder()).
+				Foreground(Error)
+
+	SelectedMessageStyle = AssistantMessageStyle.
+				BorderStyle(lipgloss.NormalBorder()).
+				BorderForeground(Success)
 )
 
 // Dialog Styles
@@ -228,14 +191,6 @@ var (
 	DialogSeparatorStyle = BaseStyle.
 				Foreground(BorderMuted)
 
-	DialogLabelStyle = BaseStyle.
-				Bold(true).
-				Foreground(TextMuted)
-
-	DialogValueStyle = BaseStyle.
-				Bold(true).
-				Foreground(TextSecondary)
-
 	DialogQuestionStyle = BaseStyle.
 				Bold(true).
 				Foreground(TextPrimary).
@@ -248,27 +203,66 @@ var (
 	DialogHelpStyle = BaseStyle.
 			Foreground(TextMuted).
 			Italic(true)
+
+	TabTitleStyle = BaseStyle.
+			Foreground(TabPrimaryFg)
+
+	TabPrimaryStyle = BaseStyle.
+			Foreground(TextPrimary)
+
+	TabStyle = TabPrimaryStyle.
+			Padding(1, 0)
+
+	TabAccentStyle = BaseStyle.
+			Foreground(TabAccentFg)
 )
 
-// Command Palette Styles
+// Command Palette Styles - rebuilt by ApplyTheme()
 var (
-	PaletteSelectedStyle = BaseStyle.
-				Background(Selected).
-				Foreground(SelectedFg).
-				Padding(0, 1)
-
-	PaletteUnselectedStyle = BaseStyle.
-				Foreground(TextPrimary).
-				Padding(0, 1)
-
 	PaletteCategoryStyle = BaseStyle.
 				Bold(true).
-				Foreground(TextMuted).
+				Foreground(White).
 				MarginTop(1)
 
-	PaletteDescStyle = BaseStyle.
-				Foreground(TextMuted)
+	PaletteUnselectedActionStyle = BaseStyle.
+					Foreground(TextPrimary).
+					Bold(true)
+
+	PaletteSelectedActionStyle = PaletteUnselectedActionStyle.
+					Background(MobyBlue).
+					Foreground(White)
+
+	PaletteUnselectedDescStyle = BaseStyle.
+					Foreground(TextSecondary)
+
+	PaletteSelectedDescStyle = PaletteUnselectedDescStyle.
+					Background(MobyBlue).
+					Foreground(White)
+
+	// Badge styles for model picker - use color vars set by ApplyTheme()
+	BadgeAlloyStyle = BaseStyle.
+			Foreground(BadgePurple)
+
+	BadgeDefaultStyle = BaseStyle.
+				Foreground(BadgeCyan)
+
+	BadgeCurrentStyle = BaseStyle.
+				Foreground(BadgeGreen)
 )
+
+// Star Styles for session browser and sidebar
+var (
+	StarredStyle   = BaseStyle.Foreground(Success)
+	UnstarredStyle = BaseStyle.Foreground(TextMuted)
+)
+
+// StarIndicator returns the styled star indicator for a given starred status
+func StarIndicator(starred bool) string {
+	if starred {
+		return StarredStyle.Render("★") + " "
+	}
+	return UnstarredStyle.Render("☆") + " "
+}
 
 // Diff Styles (matching glamour markdown theme)
 var (
@@ -281,8 +275,6 @@ var (
 			Foreground(DiffRemoveFg)
 
 	DiffUnchangedStyle = BaseStyle.Background(BackgroundAlt)
-
-	DiffContextStyle = BaseStyle
 )
 
 // Syntax highlighting UI element styles
@@ -293,21 +285,42 @@ var (
 
 // Tool Call Styles
 var (
-	ToolCallArgs = BaseStyle.
-			PaddingLeft(1).
-			BorderLeft(true).
-			BorderStyle(lipgloss.RoundedBorder()).
-			BorderForeground(BorderSecondary)
+	ToolMessageStyle = BaseStyle.
+				Foreground(TextMutedGray)
 
-	ToolCallArgKey = BaseStyle.Bold(true).Foreground(TextSecondary)
+	ToolErrorMessageStyle = BaseStyle.
+				Foreground(ErrorStrong)
 
-	ToolCallResult = BaseStyle.
-			PaddingLeft(1).
-			BorderLeft(true).
-			BorderStyle(lipgloss.RoundedBorder()).
-			BorderForeground(BorderSecondary)
+	ToolName = ToolMessageStyle.
+			Foreground(TextMutedGray).
+			Padding(0, 1)
 
-	ToolCallResultKey = BaseStyle.Bold(true).Foreground(TextSecondary)
+	ToolNameError = ToolName.
+			Foreground(ErrorStrong).
+			Background(ErrorDark)
+
+	ToolNameDim = ToolMessageStyle.
+			Foreground(TextMutedGray).
+			Italic(true)
+
+	ToolDescription = ToolMessageStyle.
+			Foreground(TextPrimary)
+
+	ToolCompletedIcon = BaseStyle.
+				MarginLeft(2).
+				Foreground(TextMutedGray)
+
+	ToolErrorIcon = ToolCompletedIcon.
+			Background(ErrorStrong)
+
+	ToolPendingIcon = ToolCompletedIcon.
+			Background(Warning)
+
+	ToolCallArgs = ToolMessageStyle.
+			Padding(0, 0, 0, 2)
+
+	ToolCallResult = ToolMessageStyle.
+			Padding(0, 0, 0, 2)
 )
 
 // Input Styles
@@ -325,15 +338,67 @@ var (
 			Color: Accent,
 		},
 	}
-	EditorStyle = BaseStyle.Padding(2, 0, 0, 0)
+
+	// DialogInputStyle is the style for textinput fields in dialogs,
+	// matching the main editor's look (cursor color, text color).
+	DialogInputStyle = textinput.Styles{
+		Focused: textinput.StyleState{
+			Text:        BaseStyle,
+			Placeholder: BaseStyle.Foreground(PlaceholderColor),
+		},
+		Blurred: textinput.StyleState{
+			Text:        BaseStyle,
+			Placeholder: BaseStyle.Foreground(PlaceholderColor),
+		},
+		Cursor: textinput.CursorStyle{
+			Color: Accent,
+		},
+	}
+	EditorStyle = BaseStyle.Padding(1, 0, 0, 0)
 	// SuggestionGhostStyle renders inline auto-complete hints in a muted tone.
-	SuggestionGhostStyle = BaseStyle.Foreground(TextMuted)
+	// Use a distinct grey so suggestion text is visually separate from the user's input.
+	// NOTE: Rebuilt by ApplyTheme() using theme's suggestion_ghost color.
+	SuggestionGhostStyle = BaseStyle.Foreground(TextMutedGray)
+	// SuggestionCursorStyle renders the first character of a suggestion inside the cursor.
+	// Uses the same blue accent background as the normal cursor, with ghost-colored foreground text.
+	// NOTE: Rebuilt by ApplyTheme().
+	SuggestionCursorStyle = BaseStyle.Background(Accent).Foreground(TextMutedGray)
+
+	// Attachment banner styles - polished look with subtle border
+	AttachmentBannerStyle = BaseStyle.
+				Foreground(TextSecondary)
+
+	AttachmentBadgeStyle = BaseStyle.
+				Foreground(Info).
+				Bold(true)
+
+	AttachmentSizeStyle = BaseStyle.
+				Foreground(TextMuted).
+				Italic(true)
+
+	AttachmentIconStyle = BaseStyle.
+				Foreground(Info)
 )
 
 // Scrollbar
 var (
-	TrackStyle = lipgloss.NewStyle().Foreground(BorderSecondary)
-	ThumbStyle = lipgloss.NewStyle().Foreground(Accent)
+	TrackStyle       = lipgloss.NewStyle().Foreground(BorderSecondary)
+	ThumbStyle       = lipgloss.NewStyle().Foreground(Info).Background(BackgroundAlt).Bold(true)
+	ThumbActiveStyle = lipgloss.NewStyle().Foreground(White).Background(BackgroundAlt).Bold(true)
+)
+
+// Resize Handle Style
+var (
+	ResizeHandleStyle = BaseStyle.
+				Foreground(BorderSecondary)
+
+	ResizeHandleHoverStyle = BaseStyle.
+				Foreground(Info).
+				Bold(true)
+
+	ResizeHandleActiveStyle = BaseStyle.
+				Foreground(White).
+				Bold(true)
 )
 
 // Notification Styles
@@ -366,16 +431,20 @@ var (
 				BorderForeground(BorderSecondary).
 				Padding(0, 1)
 
-	CompletionSelectedStyle = BaseStyle.
+	CompletionNormalStyle = BaseStyle.
 				Foreground(TextPrimary).
 				Bold(true)
 
-	CompletionNormalStyle = BaseStyle.
-				Foreground(TextPrimary)
+	CompletionSelectedStyle = CompletionNormalStyle.
+				Foreground(White).
+				Background(MobyBlue)
 
 	CompletionDescStyle = BaseStyle.
-				Foreground(TextSecondary).
-				Italic(true)
+				Foreground(TextSecondary)
+
+	CompletionSelectedDescStyle = CompletionDescStyle.
+					Foreground(White).
+					Background(MobyBlue)
 
 	CompletionNoResultsStyle = BaseStyle.
 					Foreground(TextMuted).
@@ -383,11 +452,22 @@ var (
 					Align(lipgloss.Center)
 )
 
+// Agent and transfer badge styles
+var (
+	AgentBadgeStyle = BaseStyle.
+			Foreground(AgentBadgeFg).
+			Background(AgentBadgeBg).
+			Padding(0, 1)
+
+	ThinkingBadgeStyle = BaseStyle.
+				Foreground(TextMuted). // Muted blue, distinct from gray italic content
+				Bold(true).
+				Italic(true)
+)
+
 // Deprecated styles (kept for backward compatibility)
 var (
-	StatusStyle = MutedStyle
-	ActionStyle = SecondaryStyle
-	ChatStyle   = BaseStyle
+	ChatStyle = BaseStyle
 )
 
 // Selection Styles
@@ -395,6 +475,16 @@ var (
 	SelectionStyle = BaseStyle.
 		Background(Selected).
 		Foreground(SelectedFg)
+)
+
+// Spinner Styles - rebuilt by ApplyTheme() with actual spinner colors from theme
+var (
+	SpinnerDotsAccentStyle    = BaseStyle.Foreground(Accent)
+	SpinnerDotsHighlightStyle = BaseStyle.Foreground(TabAccentFg)
+	SpinnerTextBrightestStyle = BaseStyle.Foreground(Accent)
+	SpinnerTextBrightStyle    = BaseStyle.Foreground(Accent)
+	SpinnerTextDimStyle       = BaseStyle.Foreground(Accent)
+	SpinnerTextDimmestStyle   = BaseStyle.Foreground(Accent)
 )
 
 func toChroma(style ansi.StylePrimitive) string {
@@ -459,28 +549,143 @@ func ChromaStyle() *chroma.Style {
 	return style
 }
 
+// MarkdownStyle returns the markdown style configuration, deriving colors from the current theme.
 func MarkdownStyle() ansi.StyleConfig {
-	h1Color := ColorAccentBlue
-	h2Color := ColorAccentBlue
-	h3Color := ColorTextSecondary
-	h4Color := ColorTextSecondary
-	h5Color := ColorTextSecondary
-	h6Color := ColorMutedBlue
-	linkColor := ColorAccentBlue
-	strongColor := ColorTextPrimary
-	codeColor := ColorTextPrimary
-	codeBgColor := ColorBackgroundAlt
-	blockquoteColor := ColorTextSecondary
-	listColor := ColorTextPrimary
-	hrColor := ColorBorderSecondary
-	codeBg := ColorBackgroundAlt
+	theme := CurrentTheme()
+	md := theme.Markdown
+	ch := theme.Chroma
+	colors := theme.Colors
+
+	// Use theme markdown colors with fallbacks to theme.Colors
+	headingColor := md.Heading
+	if headingColor == "" {
+		headingColor = colors.Accent
+	}
+	linkColor := md.Link
+	if linkColor == "" {
+		linkColor = colors.Accent
+	}
+	strongColor := md.Strong
+	if strongColor == "" {
+		strongColor = colors.TextPrimary
+	}
+	codeColor := md.Code
+	if codeColor == "" {
+		codeColor = colors.TextPrimary
+	}
+	codeBgColor := md.CodeBg
+	if codeBgColor == "" {
+		codeBgColor = colors.BackgroundAlt
+	}
+	blockquoteColor := md.Blockquote
+	if blockquoteColor == "" {
+		blockquoteColor = colors.TextSecondary
+	}
+	listColor := md.List
+	if listColor == "" {
+		listColor = colors.TextPrimary
+	}
+	hrColor := md.HR
+	if hrColor == "" {
+		hrColor = colors.BorderSecondary
+	}
+	// Use text primary for document text
+	textColor := colors.TextPrimary
+	textSecondary := colors.TextSecondary
+
+	// Chroma colors with fallbacks from default theme
+	defaults := DefaultTheme().Chroma
+	chromaComment := ch.Comment
+	if chromaComment == "" {
+		chromaComment = defaults.Comment
+	}
+	chromaCommentPreproc := ch.CommentPreproc
+	if chromaCommentPreproc == "" {
+		chromaCommentPreproc = defaults.CommentPreproc
+	}
+	chromaKeyword := ch.Keyword
+	if chromaKeyword == "" {
+		chromaKeyword = defaults.Keyword
+	}
+	chromaKeywordReserved := ch.KeywordReserved
+	if chromaKeywordReserved == "" {
+		chromaKeywordReserved = defaults.KeywordReserved
+	}
+	chromaKeywordNamespace := ch.KeywordNamespace
+	if chromaKeywordNamespace == "" {
+		chromaKeywordNamespace = defaults.KeywordNamespace
+	}
+	chromaKeywordType := ch.KeywordType
+	if chromaKeywordType == "" {
+		chromaKeywordType = defaults.KeywordType
+	}
+	chromaOperator := ch.Operator
+	if chromaOperator == "" {
+		chromaOperator = defaults.Operator
+	}
+	chromaPunctuation := ch.Punctuation
+	if chromaPunctuation == "" {
+		chromaPunctuation = defaults.Punctuation
+	}
+	chromaNameBuiltin := ch.NameBuiltin
+	if chromaNameBuiltin == "" {
+		chromaNameBuiltin = defaults.NameBuiltin
+	}
+	chromaNameTag := ch.NameTag
+	if chromaNameTag == "" {
+		chromaNameTag = defaults.NameTag
+	}
+	chromaNameAttribute := ch.NameAttribute
+	if chromaNameAttribute == "" {
+		chromaNameAttribute = defaults.NameAttribute
+	}
+	chromaNameDecorator := ch.NameDecorator
+	if chromaNameDecorator == "" {
+		chromaNameDecorator = defaults.NameDecorator
+	}
+	chromaLiteralNumber := ch.LiteralNumber
+	if chromaLiteralNumber == "" {
+		chromaLiteralNumber = defaults.LiteralNumber
+	}
+	chromaLiteralString := ch.LiteralString
+	if chromaLiteralString == "" {
+		chromaLiteralString = defaults.LiteralString
+	}
+	chromaLiteralStringEscape := ch.LiteralStringEscape
+	if chromaLiteralStringEscape == "" {
+		chromaLiteralStringEscape = defaults.LiteralStringEscape
+	}
+	chromaGenericDeleted := ch.GenericDeleted
+	if chromaGenericDeleted == "" {
+		chromaGenericDeleted = defaults.GenericDeleted
+	}
+	chromaGenericSubheading := ch.GenericSubheading
+	if chromaGenericSubheading == "" {
+		chromaGenericSubheading = defaults.GenericSubheading
+	}
+	chromaBackground := ch.Background
+	if chromaBackground == "" {
+		chromaBackground = colors.BackgroundAlt
+	}
+	chromaErrorFg := ch.ErrorFg
+	if chromaErrorFg == "" {
+		chromaErrorFg = defaults.ErrorFg
+	}
+	chromaErrorBg := ch.ErrorBg
+	if chromaErrorBg == "" {
+		chromaErrorBg = defaults.ErrorBg
+	}
+	chromaSuccess := ch.Success
+	if chromaSuccess == "" {
+		chromaSuccess = colors.Success
+	}
 
 	customDarkStyle := ansi.StyleConfig{
 		Document: ansi.StyleBlock{
 			StylePrimitive: ansi.StylePrimitive{
 				BlockPrefix: "",
 				BlockSuffix: "",
-				Color:       stringPtr(ANSIColor252),
+				Color:       &textColor,
 			},
 			Margin: uintPtr(0),
 		},
@@ -497,48 +702,45 @@ func MarkdownStyle() ansi.StyleConfig {
 		Heading: ansi.StyleBlock{
 			StylePrimitive: ansi.StylePrimitive{
 				BlockSuffix: "\n",
-				Color:       stringPtr(ANSIColor39),
+				Color:       &headingColor,
 				Bold:        boolPtr(true),
 			},
 		},
 		H1: ansi.StyleBlock{
 			StylePrimitive: ansi.StylePrimitive{
-				Prefix:          " ",
-				Suffix:          " ",
-				Color:           &h1Color,
-				BackgroundColor: stringPtr(ANSIColor63),
-				Bold:            boolPtr(true),
+				Prefix: "## ",
+				Color:  &headingColor,
+				Bold:   boolPtr(true),
 			},
 		},
 		H2: ansi.StyleBlock{
 			StylePrimitive: ansi.StylePrimitive{
 				Prefix: "## ",
-				Color:  &h2Color,
+				Color:  &headingColor,
 			},
 		},
 		H3: ansi.StyleBlock{
 			StylePrimitive: ansi.StylePrimitive{
 				Prefix: "### ",
-				Color:  &h3Color,
+				Color:  &headingColor,
 			},
 		},
 		H4: ansi.StyleBlock{
 			StylePrimitive: ansi.StylePrimitive{
 				Prefix: "#### ",
-				Color:  &h4Color,
+				Color:  &headingColor,
 			},
 		},
 		H5: ansi.StyleBlock{
 			StylePrimitive: ansi.StylePrimitive{
 				Prefix: "##### ",
-				Color:  &h5Color,
+				Color:  &headingColor,
 			},
 		},
 		H6: ansi.StyleBlock{
 			StylePrimitive: ansi.StylePrimitive{
 				Prefix: "###### ",
-				Color:  &h6Color,
-				Bold:   boolPtr(false),
+				Color:  &headingColor,
 			},
 		},
 		Strikethrough: ansi.StylePrimitive{
@@ -571,15 +773,15 @@ func MarkdownStyle() ansi.StyleConfig {
 			Underline: boolPtr(true),
 		},
 		LinkText: ansi.StylePrimitive{
-			Color: stringPtr(ANSIColor35),
+			Color: &linkColor,
 			Bold:  boolPtr(true),
 		},
 		Image: ansi.StylePrimitive{
-			Color:     stringPtr(ANSIColor212),
+			Color:     &linkColor,
 			Underline: boolPtr(true),
 		},
 		ImageText: ansi.StylePrimitive{
-			Color:  stringPtr(ANSIColor243),
+			Color:  &textSecondary,
 			Format: "Image: {{.text}} →",
 		},
 		Code: ansi.StyleBlock{
@@ -593,92 +795,92 @@ func MarkdownStyle() ansi.StyleConfig {
 		CodeBlock: ansi.StyleCodeBlock{
 			StyleBlock: ansi.StyleBlock{
 				StylePrimitive: ansi.StylePrimitive{
-					Color: stringPtr(ANSIColor244),
+					Color: &textSecondary,
 				},
 				Margin: uintPtr(defaultMargin),
 			},
 			Theme: "monokai",
 			Chroma: &ansi.Chroma{
 				Text: ansi.StylePrimitive{
-					Color: stringPtr(ColorTextPrimary),
+					Color: &textColor,
 				},
 				Error: ansi.StylePrimitive{
-					Color:           stringPtr(ChromaErrorFgColor),
-					BackgroundColor: stringPtr(ChromaErrorBgColor),
+					Color:           &chromaErrorFg,
+					BackgroundColor: &chromaErrorBg,
 				},
 				Comment: ansi.StylePrimitive{
-					Color: stringPtr(ChromaCommentColor),
+					Color: &chromaComment,
 				},
 				CommentPreproc: ansi.StylePrimitive{
-					Color: stringPtr(ChromaCommentPreprocColor),
+					Color: &chromaCommentPreproc,
 				},
 				Keyword: ansi.StylePrimitive{
-					Color: stringPtr(ChromaKeywordColor),
+					Color: &chromaKeyword,
 				},
 				KeywordReserved: ansi.StylePrimitive{
-					Color: stringPtr(ChromaKeywordReservedColor),
+					Color: &chromaKeywordReserved,
 				},
 				KeywordNamespace: ansi.StylePrimitive{
-					Color: stringPtr(ChromaKeywordNamespaceColor),
+					Color: &chromaKeywordNamespace,
 				},
 				KeywordType: ansi.StylePrimitive{
-					Color: stringPtr(ChromaKeywordTypeColor),
+					Color: &chromaKeywordType,
 				},
 				Operator: ansi.StylePrimitive{
-					Color: stringPtr(ChromaOperatorColor),
+					Color: &chromaOperator,
 				},
 				Punctuation: ansi.StylePrimitive{
-					Color: stringPtr(ChromaPunctuationColor),
+					Color: &chromaPunctuation,
 				},
 				Name: ansi.StylePrimitive{
-					Color: stringPtr(ColorTextPrimary),
+					Color: &textColor,
 				},
 				NameBuiltin: ansi.StylePrimitive{
-					Color: stringPtr(ChromaNameBuiltinColor),
+					Color: &chromaNameBuiltin,
 				},
 				NameTag: ansi.StylePrimitive{
-					Color: stringPtr(ChromaNameTagColor),
+					Color: &chromaNameTag,
 				},
 				NameAttribute: ansi.StylePrimitive{
-					Color: stringPtr(ChromaNameAttributeColor),
+					Color: &chromaNameAttribute,
 				},
 				NameClass: ansi.StylePrimitive{
-					Color:     stringPtr(ChromaErrorFgColor),
+					Color:     &chromaErrorFg,
 					Underline: boolPtr(true),
 					Bold:      boolPtr(true),
 				},
 				NameDecorator: ansi.StylePrimitive{
-					Color: stringPtr(ChromaNameDecoratorColor),
+					Color: &chromaNameDecorator,
 				},
 				NameFunction: ansi.StylePrimitive{
-					Color: stringPtr(ChromaSuccessColor),
+					Color: &chromaSuccess,
 				},
 				LiteralNumber: ansi.StylePrimitive{
-					Color: stringPtr(ChromaLiteralNumberColor),
+					Color: &chromaLiteralNumber,
 				},
 				LiteralString: ansi.StylePrimitive{
-					Color: stringPtr(ChromaLiteralStringColor),
+					Color: &chromaLiteralString,
 				},
 				LiteralStringEscape: ansi.StylePrimitive{
-					Color: stringPtr(ChromaLiteralStringEscapeColor),
+					Color: &chromaLiteralStringEscape,
 				},
 				GenericDeleted: ansi.StylePrimitive{
-					Color: stringPtr(ChromaGenericDeletedColor),
+					Color: &chromaGenericDeleted,
 				},
 				GenericEmph: ansi.StylePrimitive{
 					Italic: boolPtr(true),
 				},
 				GenericInserted: ansi.StylePrimitive{
-					Color: stringPtr(ChromaSuccessColor),
+					Color: &chromaSuccess,
 				},
 				GenericStrong: ansi.StylePrimitive{
 					Bold: boolPtr(true),
 				},
 				GenericSubheading: ansi.StylePrimitive{
-					Color: stringPtr(ChromaGenericSubheadingColor),
+					Color: &chromaGenericSubheading,
 				},
 				Background: ansi.StylePrimitive{
-					BackgroundColor: stringPtr(ChromaBackgroundColor),
+					BackgroundColor: &chromaBackground,
 				},
 			},
 		},
@@ -693,7 +895,7 @@ func MarkdownStyle() ansi.StyleConfig {
 	}
 
 	customDarkStyle.List.Color = &listColor
-	customDarkStyle.CodeBlock.BackgroundColor = &codeBg
+	customDarkStyle.CodeBlock.BackgroundColor = &codeBgColor
 
 	return customDarkStyle
 }
@@ -704,8 +906,4 @@ func uintPtr(u uint) *uint {
 
 func boolPtr(b bool) *bool {
 	return &b
-}
-
-func stringPtr(s string) *string {
-	return &s
 }

@@ -7,6 +7,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/docker/cagent/pkg/cli"
+	"github.com/docker/cagent/pkg/config"
 	"github.com/docker/cagent/pkg/content"
 	"github.com/docker/cagent/pkg/oci"
 	"github.com/docker/cagent/pkg/remote"
@@ -15,21 +16,20 @@ import (
 
 func newPushCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "push <agent file> <reference>",
-		Short: "Push an agent to an OCI registry",
-		Long: `Push an agent to an OCI registry.
-
-The local identifier can be either a reference (tag) or a digest that was returned
-from the build command.`,
-		Args: cobra.ExactArgs(2),
-		RunE: runPushCommand,
+		Use:     "push <agent-file> <registry-ref>",
+		Short:   "Push an agent to an OCI registry",
+		Long:    "Push an agent configuration file to an OCI registry",
+		GroupID: "core",
+		Args:    cobra.ExactArgs(2),
+		RunE:    runPushCommand,
 	}
 }
 
 func runPushCommand(cmd *cobra.Command, args []string) error {
 	telemetry.TrackCommand("push", args)
 
-	filePath := args[0]
+	ctx := cmd.Context()
+	agentFilename := args[0]
 	tag := args[1]
 	out := cli.NewPrinter(cmd.OutOrStdout())
 
@@ -38,14 +38,19 @@ func runPushCommand(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	_, err = oci.PackageFileAsOCIToStore(filePath, tag, store)
+	agentSource, err := config.Resolve(agentFilename)
+	if err != nil {
+		return fmt.Errorf("resolving agent file: %w", err)
+	}
+
+	_, err = oci.PackageFileAsOCIToStore(ctx, agentSource, tag, store)
 	if err != nil {
 		return fmt.Errorf("failed to build artifact: %w", err)
 	}
 
 	slog.Debug("Starting push", "registry_ref", tag)
 
-	out.Printf("Pushing agent %s to %s\n", filePath, tag)
+	out.Printf("Pushing agent %s to %s\n", agentFilename, tag)
 
 	err = remote.Push(tag)
 	if err != nil {

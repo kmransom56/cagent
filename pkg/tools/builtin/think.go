@@ -2,8 +2,6 @@ package builtin
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 	"strings"
 
 	"github.com/docker/cagent/pkg/tools"
@@ -12,37 +10,26 @@ import (
 const ToolNameThink = "think"
 
 type ThinkTool struct {
-	tools.ElicitationTool
-	handler *thinkHandler
-}
-
-// Make sure Think Tool implements the ToolSet Interface
-var _ tools.ToolSet = (*ThinkTool)(nil)
-
-type thinkHandler struct {
 	thoughts []string
 }
+
+// Verify interface compliance
+var (
+	_ tools.ToolSet      = (*ThinkTool)(nil)
+	_ tools.Instructable = (*ThinkTool)(nil)
+)
 
 type ThinkArgs struct {
 	Thought string `json:"thought" jsonschema:"The thought to think about"`
 }
 
-func (h *thinkHandler) CallTool(_ context.Context, toolCall tools.ToolCall) (*tools.ToolCallResult, error) {
-	var params ThinkArgs
-	if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &params); err != nil {
-		return nil, fmt.Errorf("invalid arguments: %w", err)
-	}
-
-	h.thoughts = append(h.thoughts, params.Thought)
-	return &tools.ToolCallResult{
-		Output: "Thoughts:\n" + strings.Join(h.thoughts, "\n"),
-	}, nil
+func (t *ThinkTool) callTool(_ context.Context, params ThinkArgs) (*tools.ToolCallResult, error) {
+	t.thoughts = append(t.thoughts, params.Thought)
+	return tools.ResultSuccess("Thoughts:\n" + strings.Join(t.thoughts, "\n")), nil
 }
 
 func NewThinkTool() *ThinkTool {
-	return &ThinkTool{
-		handler: &thinkHandler{},
-	}
+	return &ThinkTool{}
 }
 
 func (t *ThinkTool) Instructions() string {
@@ -66,19 +53,11 @@ func (t *ThinkTool) Tools(context.Context) ([]tools.Tool, error) {
 			Description:  "Use the tool to think about something. It will not obtain new information or change the database, but just append the thought to the log. Use it when complex reasoning or some cache memory is needed.",
 			Parameters:   tools.MustSchemaFor[ThinkArgs](),
 			OutputSchema: tools.MustSchemaFor[string](),
-			Handler:      t.handler.CallTool,
+			Handler:      tools.NewHandler(t.callTool),
 			Annotations: tools.ToolAnnotations{
 				ReadOnlyHint: true,
 				Title:        "Think",
 			},
 		},
 	}, nil
-}
-
-func (t *ThinkTool) Start(context.Context) error {
-	return nil
-}
-
-func (t *ThinkTool) Stop(context.Context) error {
-	return nil
 }

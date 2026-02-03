@@ -9,12 +9,12 @@ import (
 func renderTodoIcon(status string) (string, lipgloss.Style) {
 	switch status {
 	case "pending":
-		return "◯", styles.PendingStyle
+		return "◯", styles.ToBeDoneStyle
 	case "in-progress":
-		return "◕", styles.InProgressStyle
+		return "◔", styles.InProgressStyle
 	case "completed":
-		return "✓", styles.MutedStyle
+		return "✓", styles.CompletedStyle.Strikethrough(true)
 	default:
-		return "?", styles.BaseStyle
+		return "?", styles.ToBeDoneStyle
 	}
 }

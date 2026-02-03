@@ -1,6 +1,7 @@
 package builtin
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -9,32 +10,63 @@ import (
 	"slices"
 	"strings"
 
-	latest "github.com/docker/cagent/pkg/config/v2"
+	"github.com/docker/cagent/pkg/config/latest"
 	"github.com/docker/cagent/pkg/tools"
 )
 
 type ScriptShellTool struct {
-	tools.ElicitationTool
 	shellTools map[string]latest.ScriptShellToolConfig
 	env        []string
 }
 
-var _ tools.ToolSet = (*ScriptShellTool)(nil)
+// Verify interface compliance
+var (
+	_ tools.ToolSet      = (*ScriptShellTool)(nil)
+	_ tools.Instructable = (*ScriptShellTool)(nil)
+)
 
-func NewScriptShellTool(shellTools map[string]latest.ScriptShellToolConfig, env []string) *ScriptShellTool {
-	for _, tool := range shellTools {
-		// If no required array was set, all arguments are required
-		if tool.Required == nil {
-			tool.Required = make([]string, len(tool.Args))
-			for argName := range tool.Args {
-				tool.Required = append(tool.Required, argName)
-			}
+func NewScriptShellTool(shellTools map[string]latest.ScriptShellToolConfig, env []string) (*ScriptShellTool, error) {
+	for toolName, tool := range shellTools {
+		if err := validateConfig(toolName, tool); err != nil {
+			return nil, err
 		}
 	}
+
 	return &ScriptShellTool{
 		shellTools: shellTools,
 		env:        env,
+	}, nil
+}
+
+func validateConfig(toolName string, tool latest.ScriptShellToolConfig) error {
+	// If no required array was set, all arguments are required
+	if tool.Required == nil {
+		tool.Required = make([]string, 0, len(tool.Args))
+		for argName := range tool.Args {
+			tool.Required = append(tool.Required, argName)
+		}
 	}
+
+	// Check for typos in args
+	var missingArgs []string
+	os.Expand(tool.Cmd, func(varName string) string {
+		if _, ok := tool.Args[varName]; !ok {
+			missingArgs = append(missingArgs, varName)
+		}
+		return ""
+	})
+	if len(missingArgs) > 0 {
+		return fmt.Errorf("tool '%s' uses undefined args: %v", toolName, missingArgs)
+	}
+
+	// Check that all required args are defined
+	for _, reqArg := range tool.Required {
+		if _, ok := tool.Args[reqArg]; !ok {
+			return fmt.Errorf("tool '%s' has required arg '%s' which is not defined in args", toolName, reqArg)
+		}
+	}
+
+	return nil
 }
 
 func (t *ScriptShellTool) Instructions() string {
@@ -43,11 +75,11 @@ func (t *ScriptShellTool) Instructions() string {
 	instructions.WriteString("The following custom shell tools are available:\n\n")
 
 	for name, tool := range t.shellTools {
-		instructions.WriteString(fmt.Sprintf("### %s\n", name))
+		fmt.Fprintf(&instructions, "### %s\n", name)
 		if tool.Description != "" {
-			instructions.WriteString(fmt.Sprintf("%s\n\n", tool.Description))
+			fmt.Fprintf(&instructions, "%s\n\n", tool.Description)
 		} else {
-			instructions.WriteString(fmt.Sprintf("Execute: `%s`\n\n", tool.Cmd))
+			fmt.Fprintf(&instructions, "Execute: `%s`\n\n", tool.Cmd)
 		}
 
 		if len(tool.Args) > 0 {
@@ -58,7 +90,7 @@ func (t *ScriptShellTool) Instructions() string {
 					required = " (required)"
 				}
 				description := argDef.(map[string]any)["description"].(string)
-				instructions.WriteString(fmt.Sprintf("- `%s`: %s%s\n", argName, description, required))
+				fmt.Fprintf(&instructions, "- `%s`: %s%s\n", argName, description, required)
 			}
 			instructions.WriteString("\n")
 		}
@@ -74,10 +106,7 @@ func (t *ScriptShellTool) Tools(context.Context) ([]tools.Tool, error) {
 		cfg := toolConfig
 		toolName := name
 
-		description := cfg.Description
-		if description == "" {
-			description = fmt.Sprintf("Execute shell command: %s", cfg.Cmd)
-		}
+		description := cmp.Or(cfg.Description, fmt.Sprintf("Execute shell command: %s", cfg.Cmd))
 
 		inputSchema, err := tools.SchemaToMap(map[string]any{
 			"type":       "object",
@@ -111,10 +140,7 @@ func (t *ScriptShellTool) execute(ctx context.Context, toolConfig *latest.Script
 	}
 
 	// Use default shell
-	shell := os.Getenv("SHELL")
-	if shell == "" {
-		shell = "/bin/sh"
-	}
+	shell := cmp.Or(os.Getenv("SHELL"), "/bin/sh")
 
 	cmd := exec.CommandContext(ctx, shell, "-c", toolConfig.Cmd)
 	cmd.Dir = toolConfig.WorkingDir
@@ -127,20 +153,8 @@ func (t *ScriptShellTool) execute(ctx context.Context, toolConfig *latest.Script
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return &tools.ToolCallResult{
-			Output: fmt.Sprintf("Error executing command '%s': %s\nOutput: %s", toolConfig.Cmd, err, string(output)),
-		}, nil
+		return tools.ResultError(fmt.Sprintf("Error executing command '%s': %s\nOutput: %s", toolConfig.Cmd, err, limitOutput(string(output)))), nil
 	}
 
-	return &tools.ToolCallResult{
-		Output: string(output),
-	}, nil
-}
-
-func (t *ScriptShellTool) Start(context.Context) error {
-	return nil
-}
-
-func (t *ScriptShellTool) Stop(context.Context) error {
-	return nil
+	return tools.ResultSuccess(limitOutput(string(output))), nil
 }

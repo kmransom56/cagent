@@ -1,53 +1,44 @@
 package config
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"log/slog"
-	"os"
+	"net/url"
+	"slices"
 	"strings"
 
 	"github.com/goccy/go-yaml"
 
-	v0 "github.com/docker/cagent/pkg/config/v0"
-	v1 "github.com/docker/cagent/pkg/config/v1"
-	latest "github.com/docker/cagent/pkg/config/v2" //nolint:staticcheck // This is used everywhere we reference the latest version
-	v2 "github.com/docker/cagent/pkg/config/v2"     //nolint:staticcheck // This is used for migrations to v2
+	"github.com/docker/cagent/pkg/config/latest"
 	"github.com/docker/cagent/pkg/environment"
-	"github.com/docker/cagent/pkg/filesystem"
 )
 
-func LoadConfigSecureDeprecated(path, allowedDir string) (*latest.Config, error) {
-	fs, err := os.OpenRoot(allowedDir)
-	if err != nil {
-		return nil, fmt.Errorf("opening filesystem %s: %w", allowedDir, err)
-	}
-
-	return LoadConfig(path, fs)
+type Reader interface {
+	Read(ctx context.Context) ([]byte, error)
 }
 
-func LoadConfig(path string, fs filesystem.FS) (*latest.Config, error) {
-	data, err := fs.ReadFile(path)
+func Load(ctx context.Context, source Reader) (*latest.Config, error) {
+	data, err := source.Read(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("reading config file: %w", err)
+		return nil, err
 	}
 
 	var raw struct {
 		Version string `yaml:"version,omitempty"`
 	}
-	if err := yaml.UnmarshalWithOptions(data, &raw); err != nil {
-		return nil, fmt.Errorf("looking for version in config file %s\n%s", path, yaml.FormatError(err, true, true))
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("looking for version in config file\n%s", yaml.FormatError(err, true, true))
 	}
-	if raw.Version == "" {
-		raw.Version = latest.Version
-	}
+	raw.Version = cmp.Or(raw.Version, latest.Version)
 
 	oldConfig, err := parseCurrentVersion(data, raw.Version)
 	if err != nil {
-		return nil, fmt.Errorf("parsing config file %s\n%s", path, yaml.FormatError(err, true, true))
+		return nil, fmt.Errorf("parsing config file\n%s", yaml.FormatError(err, true, true))
 	}
 
-	config, err := migrateToLatestConfig(oldConfig)
+	config, err := migrateToLatestConfig(oldConfig, data)
 	if err != nil {
 		return nil, fmt.Errorf("migrating config: %w", err)
 	}
@@ -64,8 +55,8 @@ func LoadConfig(path string, fs filesystem.FS) (*latest.Config, error) {
 // CheckRequiredEnvVars checks which environment variables are required by the models and tools.
 //
 // This allows exiting early with a proper error message instead of failing later when trying to use a model or tool.
-func CheckRequiredEnvVars(ctx context.Context, cfg *latest.Config, env environment.Provider, runtimeConfig RuntimeConfig) error {
-	missing, err := gatherMissingEnvVars(ctx, cfg, env, runtimeConfig)
+func CheckRequiredEnvVars(ctx context.Context, cfg *latest.Config, modelsGateway string, env environment.Provider) error {
+	missing, err := gatherMissingEnvVars(ctx, cfg, modelsGateway, env)
 	if err != nil {
 		// If there's a tool preflight error, log it but continue
 		slog.Warn("Failed to preflight toolset environment variables; continuing", "error", err)
@@ -82,49 +73,31 @@ func CheckRequiredEnvVars(ctx context.Context, cfg *latest.Config, env environme
 }
 
 func parseCurrentVersion(data []byte, version string) (any, error) {
-	options := []yaml.DecodeOption{yaml.Strict()}
-
-	switch version {
-	case v0.Version:
-		var cfg v0.Config
-		err := yaml.UnmarshalWithOptions(data, &cfg, options...)
-		return cfg, err
-	case v1.Version:
-		var cfg v1.Config
-		err := yaml.UnmarshalWithOptions(data, &cfg, options...)
-		return cfg, err
-	case v2.Version:
-		var cfg v2.Config
-		err := yaml.UnmarshalWithOptions(data, &cfg, options...)
-		return cfg, err
-	default:
+	parser, found := Parsers()[version]
+	if !found {
 		return nil, fmt.Errorf("unsupported config version: %v", version)
 	}
+	return parser(data)
 }
 
-func migrateToLatestConfig(c any) (latest.Config, error) {
+func migrateToLatestConfig(c any, raw []byte) (latest.Config, error) {
 	var err error
-	for {
-		if old, ok := c.(v0.Config); ok {
-			c, err = v1.UpgradeFrom(old)
-			if err != nil {
-				return latest.Config{}, err
-			}
-			continue
-		}
-		if old, ok := c.(v1.Config); ok {
-			c, err = latest.UpgradeFrom(old)
-			if err != nil {
-				return latest.Config{}, err
-			}
-			continue
-		}
 
-		return c.(latest.Config), nil
+	for _, upgrade := range Upgrades() {
+		c, err = upgrade(c, raw)
+		if err != nil {
+			return latest.Config{}, err
+		}
 	}
+
+	return c.(latest.Config), nil
 }
 
 func validateConfig(cfg *latest.Config) error {
+	if err := validateProviders(cfg); err != nil {
+		return err
+	}
+
 	if cfg.Models == nil {
 		cfg.Models = map[string]latest.ModelConfig{}
 	}
@@ -137,30 +110,24 @@ func validateConfig(cfg *latest.Config) error {
 		}
 	}
 
-	for agentName := range cfg.Agents {
-		agent := cfg.Agents[agentName]
+	if err := ensureModelsExist(cfg); err != nil {
+		return err
+	}
 
-		modelNames := strings.SplitSeq(agent.Model, ",")
-		for modelName := range modelNames {
-			if _, exists := cfg.Models[modelName]; exists {
-				continue
-			}
+	allNames := map[string]bool{}
+	for _, agent := range cfg.Agents {
+		allNames[agent.Name] = true
+	}
 
-			provider, model, ok := strings.Cut(modelName, "/")
-			if !ok {
-				return fmt.Errorf("agent '%s' references non-existent model '%s'", agentName, modelName)
-			}
-
-			cfg.Models[modelName] = latest.ModelConfig{
-				Provider: provider,
-				Model:    model,
+	for _, agent := range cfg.Agents {
+		for _, subAgentName := range agent.SubAgents {
+			if _, exists := allNames[subAgentName]; !exists {
+				return fmt.Errorf("agent '%s' references non-existent sub-agent '%s'", agent.Name, subAgentName)
 			}
 		}
 
-		for _, subAgentName := range agent.SubAgents {
-			if _, exists := cfg.Agents[subAgentName]; !exists {
-				return fmt.Errorf("agent '%s' references non-existent sub-agent '%s'", agentName, subAgentName)
-			}
+		if err := validateSkillsConfiguration(agent.Name, &agent); err != nil {
+			return err
 		}
 	}
 
@@ -169,4 +136,98 @@ func validateConfig(cfg *latest.Config) error {
 
 func boolPtr(b bool) *bool {
 	return &b
+}
+
+// providerAPITypes are the allowed values for api_type in provider configs
+var providerAPITypes = map[string]bool{
+	"":                       true, // empty is allowed (defaults to openai_chatcompletions)
+	"openai_chatcompletions": true,
+	"openai_responses":       true,
+}
+
+// validateProviders validates all provider configurations
+func validateProviders(cfg *latest.Config) error {
+	if cfg.Providers == nil {
+		return nil
+	}
+
+	for name, provCfg := range cfg.Providers {
+		// Validate provider name
+		if err := validateProviderName(name); err != nil {
+			return fmt.Errorf("provider '%s': %w", name, err)
+		}
+
+		// Validate api_type
+		if !providerAPITypes[provCfg.APIType] {
+			return fmt.Errorf("provider '%s': invalid api_type '%s' (must be one of: openai_chatcompletions, openai_responses)", name, provCfg.APIType)
+		}
+
+		// base_url is required for custom providers
+		if provCfg.BaseURL == "" {
+			return fmt.Errorf("provider '%s': base_url is required", name)
+		}
+		if _, err := url.Parse(provCfg.BaseURL); err != nil {
+			return fmt.Errorf("provider '%s': invalid base_url '%s': %w", name, provCfg.BaseURL, err)
+		}
+
+		// token_key is optional - if not set, requests will be sent without bearer token
+	}
+
+	return nil
+}
+
+// validateProviderName validates that a provider name is valid
+func validateProviderName(name string) error {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return fmt.Errorf("name cannot be empty")
+	}
+	if trimmed != name {
+		return fmt.Errorf("name cannot have leading or trailing whitespace")
+	}
+	if strings.Contains(name, "/") {
+		return fmt.Errorf("name cannot contain '/'")
+	}
+	return nil
+}
+
+// validateSkillsConfiguration ensures that agents with skills enabled have the necessary tools
+func validateSkillsConfiguration(agentName string, agent *latest.AgentConfig) error {
+	// Check if skills are enabled
+	if agent.Skills == nil || !*agent.Skills {
+		return nil
+	}
+
+	// Skills are enabled, validate toolsets
+	hasFilesystemToolset := false
+	hasReadFileTool := false
+
+	for _, toolset := range agent.Toolsets {
+		if toolset.Type == "filesystem" {
+			hasFilesystemToolset = true
+
+			// Check if read_file tool is enabled
+			// If no specific tools are listed, all tools are enabled
+			if len(toolset.Tools) == 0 {
+				hasReadFileTool = true
+				break
+			}
+
+			// Check if read_file is in the tools list
+			if slices.Contains(toolset.Tools, "read_file") {
+				hasReadFileTool = true
+				break
+			}
+		}
+	}
+
+	if !hasFilesystemToolset {
+		return fmt.Errorf("agent '%s' has skills enabled but does not have a 'filesystem' toolset configured", agentName)
+	}
+
+	if !hasReadFileTool {
+		return fmt.Errorf("agent '%s' has skills enabled but the 'filesystem' toolset does not include the 'read_file' tool", agentName)
+	}
+
+	return nil
 }

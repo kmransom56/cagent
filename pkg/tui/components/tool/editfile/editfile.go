@@ -4,11 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"charm.land/bubbles/v2/spinner"
-	tea "charm.land/bubbletea/v2"
-	"github.com/charmbracelet/glamour/v2"
-
 	"github.com/docker/cagent/pkg/tools/builtin"
+	"github.com/docker/cagent/pkg/tui/components/spinner"
 	"github.com/docker/cagent/pkg/tui/components/toolcommon"
 	"github.com/docker/cagent/pkg/tui/core/layout"
 	"github.com/docker/cagent/pkg/tui/service"
@@ -18,76 +15,137 @@ import (
 
 type ToggleDiffViewMsg struct{}
 
-// Component is a specialized component for rendering edit_file tool calls.
-type Component struct {
-	message      *types.Message
-	renderer     *glamour.TermRenderer
-	spinner      spinner.Model
-	width        int
-	height       int
-	sessionState *service.SessionState
+// New creates the edit_file tool UI model.
+func New(msg *types.Message, sessionState service.SessionStateReader) layout.Model {
+	return toolcommon.NewBaseWithCollapsed(msg, sessionState, render, renderCollapsed)
 }
 
-func New(
+// render displays the edit_file tool output in the TUI.
+// It prioritizes the agent-provided friendly header when available,
+// hides results when collapsed by the user, and renders tool errors
+// in a single-line error style consistent with other tools.
+func render(
 	msg *types.Message,
-	renderer *glamour.TermRenderer,
-	sessionState *service.SessionState,
-) layout.Model {
-	return &Component{
-		message:      msg,
-		renderer:     renderer,
-		spinner:      spinner.New(spinner.WithSpinner(spinner.Points)),
-		width:        80,
-		height:       1,
-		sessionState: sessionState,
-	}
-}
-
-func (c *Component) SetSize(width, height int) tea.Cmd {
-	c.width = width
-	c.height = height
-	return nil
-}
-
-func (c *Component) Init() tea.Cmd {
-	if c.message.ToolStatus == types.ToolStatusPending || c.message.ToolStatus == types.ToolStatusRunning {
-		return c.spinner.Tick
-	}
-	return nil
-}
-
-func (c *Component) Update(msg tea.Msg) (layout.Model, tea.Cmd) {
-	if c.message.ToolStatus == types.ToolStatusPending || c.message.ToolStatus == types.ToolStatusRunning {
-		var cmd tea.Cmd
-		c.spinner, cmd = c.spinner.Update(msg)
-		return c, cmd
+	s spinner.Spinner,
+	sessionState service.SessionStateReader,
+	width,
+	_ int,
+) string {
+	// Parse tool arguments to extract the file path for display.
+	var args builtin.EditFileArgs
+	if err := json.Unmarshal([]byte(msg.ToolCall.Function.Arguments), &args); err != nil {
+		// If arguments cannot be parsed, fail silently to avoid breaking the TUI.
+		return ""
 	}
 
-	return c, nil
+	// When the tool failed, render a single-line error header
+	// consistent with other tool error renderings.
+	if msg.ToolStatus == types.ToolStatusError {
+		if msg.Content == "" {
+			return ""
+		}
+
+		// Render everything on a single line:
+		// - error icon
+		// - tool name in error style
+		// - rejection/error message
+		line := fmt.Sprintf(
+			"%s%s %s",
+			toolcommon.Icon(msg, s),
+			styles.ToolNameError.Render(msg.ToolDefinition.DisplayName()),
+			styles.ToolErrorMessageStyle.Render(msg.Content),
+		)
+
+		// Truncate to terminal width to avoid wrapping
+		return styles.BaseStyle.
+			MaxWidth(width).
+			Render(line)
+	}
+
+	// ---- Normal (non-error) rendering ----
+
+	// Check for friendly description first
+	var content string
+	if header, ok := toolcommon.RenderFriendlyHeader(msg, s); ok {
+		content = header
+	} else {
+		content = fmt.Sprintf(
+			"%s%s %s",
+			toolcommon.Icon(msg, s),
+			styles.ToolName.Render(msg.ToolDefinition.DisplayName()),
+			styles.ToolMessageStyle.Render(toolcommon.ShortenPath(args.Path)),
+		)
+	}
+
+	// Tool results are hidden when the user collapses them.
+	if sessionState.HideToolResults() {
+		return content
+	}
+
+	// Successful (or pending/confirmation) execution:
+	// render the diff output inside the ToolCallResult container.
+	if msg.ToolCall.Function.Arguments != "" {
+		// Calculate available width for diff rendering, accounting for
+		// ToolCallResult frame padding.
+		contentWidth := width - styles.ToolCallResult.GetHorizontalFrameSize()
+
+		content += "\n" + styles.ToolCallResult.Render(
+			renderEditFile(
+				msg.ToolCall,
+				contentWidth,
+				sessionState.SplitDiffView(),
+				msg.ToolStatus,
+			),
+		)
+	}
+
+	return content
 }
 
-func (c *Component) View() string {
-	msg := c.message
+// renderCollapsed renders a simplified view for collapsed reasoning blocks.
+// Shows only the file path and +N / -M line counts.
+func renderCollapsed(
+	msg *types.Message,
+	s spinner.Spinner,
+	_ service.SessionStateReader,
+	width,
+	_ int,
+) string {
 	var args builtin.EditFileArgs
 	if err := json.Unmarshal([]byte(msg.ToolCall.Function.Arguments), &args); err != nil {
 		return ""
 	}
 
-	displayName := msg.ToolDefinition.DisplayName()
-	content := fmt.Sprintf("%s %s %s", toolcommon.Icon(msg.ToolStatus), styles.HighlightStyle.Render(displayName), styles.MutedStyle.Render(args.Path))
-
-	if msg.ToolStatus == types.ToolStatusPending || msg.ToolStatus == types.ToolStatusRunning {
-		content += " " + c.spinner.View()
+	// Error state
+	if msg.ToolStatus == types.ToolStatusError {
+		if msg.Content == "" {
+			return ""
+		}
+		line := fmt.Sprintf(
+			"%s%s %s",
+			toolcommon.Icon(msg, s),
+			styles.ToolNameError.Render(msg.ToolDefinition.DisplayName()),
+			styles.ToolErrorMessageStyle.Render(msg.Content),
+		)
+		return styles.BaseStyle.MaxWidth(width).Render(line)
 	}
 
-	if msg.ToolCall.Function.Arguments != "" {
-		content += "\n\n" + styles.ToolCallResult.Render(renderEditFile(msg.ToolCall, c.width-4, c.sessionState.SplitDiffView, msg.ToolStatus))
+	// Count added/removed lines
+	added, removed := countDiffLines(msg.ToolCall, msg.ToolStatus)
+	var diffSummary string
+	if added > 0 || removed > 0 {
+		addStr := styles.DiffAddStyle.Render(fmt.Sprintf("+%d", added))
+		remStr := styles.DiffRemoveStyle.Render(fmt.Sprintf("-%d", removed))
+		diffSummary = fmt.Sprintf(" %s / %s", addStr, remStr)
 	}
 
-	var resultContent string
-	if (msg.ToolStatus == types.ToolStatusCompleted || msg.ToolStatus == types.ToolStatusError) && msg.Content != "" {
-		resultContent = toolcommon.FormatToolResult(msg.Content, c.width)
-	}
+	line := fmt.Sprintf(
+		"%s%s %s%s",
+		toolcommon.Icon(msg, s),
+		styles.ToolName.Render(msg.ToolDefinition.DisplayName()),
+		styles.ToolMessageStyle.Render(toolcommon.ShortenPath(args.Path)),
+		diffSummary,
+	)
 
-	return styles.BaseStyle.PaddingLeft(2).PaddingTop(1).Render(content + resultContent)
+	return styles.BaseStyle.MaxWidth(width).Render(line)
 }

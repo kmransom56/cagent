@@ -3,6 +3,7 @@ package environment
 import (
 	"context"
 	"os"
+	"strings"
 )
 
 // OsEnvProvider provides access to the operating system's environment variables.
@@ -12,31 +13,53 @@ func NewOsEnvProvider() *OsEnvProvider {
 	return &OsEnvProvider{}
 }
 
-func (p *OsEnvProvider) Get(_ context.Context, name string) string {
-	return os.Getenv(name)
+func (p *OsEnvProvider) Get(_ context.Context, name string) (string, bool) {
+	return os.LookupEnv(name)
 }
 
-type EnvFilesProviders struct {
+// EnvListProvider provides access a list of environment variables.
+type EnvListProvider struct {
+	env []string
+}
+
+func NewEnvListProvider(env []string) *EnvListProvider {
+	return &EnvListProvider{
+		env: env,
+	}
+}
+
+func (p *EnvListProvider) Get(_ context.Context, name string) (string, bool) {
+	for _, e := range p.env {
+		n, v, ok := strings.Cut(e, "=")
+		if ok && n == name {
+			return v, true
+		}
+	}
+	return "", false
+}
+
+// EnvFilesProvider provides access env files.
+type EnvFilesProvider struct {
 	values []KeyValuePair
 }
 
-func NewEnvFilesProvider(absEnvFiles []string) (*EnvFilesProviders, error) {
+func NewEnvFilesProvider(absEnvFiles []string) (*EnvFilesProvider, error) {
 	values, err := ReadEnvFiles(absEnvFiles)
 	if err != nil {
 		return nil, err
 	}
 
-	return &EnvFilesProviders{
+	return &EnvFilesProvider{
 		values: values,
 	}, nil
 }
 
-func (p *EnvFilesProviders) Get(_ context.Context, name string) string {
+func (p *EnvFilesProvider) Get(_ context.Context, name string) (string, bool) {
 	for _, kv := range p.values {
 		if kv.Key == name {
-			return kv.Value
+			return kv.Value, true
 		}
 	}
 
-	return ""
+	return "", false
 }

@@ -5,6 +5,7 @@ import (
 	"charm.land/lipgloss/v2"
 
 	"github.com/docker/cagent/pkg/tui/core/layout"
+	"github.com/docker/cagent/pkg/tui/messages"
 )
 
 // OpenDialogMsg is sent to open a new dialog
@@ -65,6 +66,16 @@ func (d *manager) Update(msg tea.Msg) (layout.Model, tea.Cmd) {
 		}
 		return d, tea.Batch(cmds...)
 
+	case messages.ThemeChangedMsg:
+		// Propagate theme change to all dialogs in the stack so they can invalidate caches
+		var cmds []tea.Cmd
+		for i := range d.dialogStack {
+			u, cmd := d.dialogStack[i].Update(msg)
+			d.dialogStack[i] = u.(Dialog)
+			cmds = append(cmds, cmd)
+		}
+		return d, tea.Batch(cmds...)
+
 	case OpenDialogMsg:
 		return d.handleOpen(msg)
 
@@ -115,7 +126,7 @@ func (d *manager) handleOpen(msg OpenDialogMsg) (layout.Model, tea.Cmd) {
 
 // handleClose processes dialog closing requests (pops top dialog from stack)
 func (d *manager) handleClose() (layout.Model, tea.Cmd) {
-	if len(d.dialogStack) != 0 {
+	if len(d.dialogStack) > 0 {
 		d.dialogStack = d.dialogStack[:len(d.dialogStack)-1]
 	}
 
@@ -137,6 +148,19 @@ func (d *manager) SetSize(width, height int) tea.Cmd {
 	d.width = width
 	d.height = height
 	return nil
+}
+
+// CenterPosition calculates the centered position for a dialog given screen and dialog dimensions.
+// Returns (row, col) suitable for use in Dialog.Position().
+func CenterPosition(screenWidth, screenHeight, dialogWidth, dialogHeight int) (row, col int) {
+	col = max(0, (screenWidth-dialogWidth)/2)
+	row = max(0, (screenHeight-dialogHeight)/2)
+
+	// Ensure dialog fits on screen
+	col = min(col, max(0, screenWidth-dialogWidth))
+	row = min(row, max(0, screenHeight-dialogHeight))
+
+	return row, col
 }
 
 // GetLayers returns lipgloss layers for rendering all dialogs in the stack

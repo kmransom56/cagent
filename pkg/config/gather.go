@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
+	"maps"
+	"os"
+	"slices"
+	"strings"
 
-	latest "github.com/docker/cagent/pkg/config/v2"
+	"github.com/docker/cagent/pkg/config/latest"
 	"github.com/docker/cagent/pkg/environment"
 	"github.com/docker/cagent/pkg/gateway"
 	"github.com/docker/cagent/pkg/model/provider"
@@ -14,11 +17,11 @@ import (
 
 // gatherMissingEnvVars finds out which environment variables are required by the models and tools.
 // It returns the missing variables and any non-fatal error encountered during tool discovery.
-func gatherMissingEnvVars(ctx context.Context, cfg *latest.Config, env environment.Provider, runtimeConfig RuntimeConfig) (missing []string, toolErr error) {
+func gatherMissingEnvVars(ctx context.Context, cfg *latest.Config, modelsGateway string, env environment.Provider) (missing []string, toolErr error) {
 	requiredEnv := map[string]bool{}
 
 	// Models
-	if runtimeConfig.ModelsGateway == "" {
+	if modelsGateway == "" {
 		names := GatherEnvVarsForModels(cfg)
 		for _, e := range names {
 			requiredEnv[e] = true
@@ -36,8 +39,8 @@ func gatherMissingEnvVars(ctx context.Context, cfg *latest.Config, env environme
 		}
 	}
 
-	for _, e := range mcpToSortedList(requiredEnv) {
-		if env.Get(ctx, e) == "" {
+	for _, e := range sortedKeys(requiredEnv) {
+		if v, _ := env.Get(ctx, e); v == "" {
 			missing = append(missing, e)
 		}
 	}
@@ -48,86 +51,115 @@ func gatherMissingEnvVars(ctx context.Context, cfg *latest.Config, env environme
 func GatherEnvVarsForModels(cfg *latest.Config) []string {
 	requiredEnv := map[string]bool{}
 
-	for name := range cfg.Models {
-		model := cfg.Models[name]
-
-		// Use the token environment variable from the alias if available
-		if alias, exists := provider.ProviderAliases[model.Provider]; exists {
-			if alias.TokenEnvVar != "" {
-				requiredEnv[alias.TokenEnvVar] = true
-			}
-		} else {
-			// Fallback to hardcoded mappings for unknown providers
-			switch model.Provider {
-			case "openai":
-				requiredEnv["OPENAI_API_KEY"] = true
-			case "anthropic":
-				requiredEnv["ANTHROPIC_API_KEY"] = true
-			case "google":
-				requiredEnv["GOOGLE_API_KEY"] = true
-			case "mistral":
-				requiredEnv["MISTRAL_API_KEY"] = true
-			}
+	// Inspect only the models that are actually used by agents
+	for _, agent := range cfg.Agents {
+		modelNames := strings.SplitSeq(agent.Model, ",")
+		for modelName := range modelNames {
+			modelName = strings.TrimSpace(modelName)
+			gatherEnvVarsForModel(cfg, modelName, requiredEnv)
 		}
 	}
 
-	return mcpToSortedList(requiredEnv)
+	return sortedKeys(requiredEnv)
+}
+
+// gatherEnvVarsForModel collects required environment variables for a single model,
+// including any models referenced in its routing rules.
+func gatherEnvVarsForModel(cfg *latest.Config, modelName string, requiredEnv map[string]bool) {
+	model := cfg.Models[modelName]
+
+	// Add env vars for the model itself
+	addEnvVarsForModelConfig(&model, cfg.Providers, requiredEnv)
+
+	// If the model has routing rules, also check all referenced models
+	for _, rule := range model.Routing {
+		ruleModelName := rule.Model
+		if ruleModel, exists := cfg.Models[ruleModelName]; exists {
+			// Model reference - add its env vars
+			addEnvVarsForModelConfig(&ruleModel, cfg.Providers, requiredEnv)
+		} else if providerName, _, ok := strings.Cut(ruleModelName, "/"); ok {
+			// Inline spec (e.g., "openai/gpt-4o") - infer env vars from provider
+			inlineModel := latest.ModelConfig{Provider: providerName}
+			addEnvVarsForModelConfig(&inlineModel, cfg.Providers, requiredEnv)
+		}
+	}
+}
+
+// addEnvVarsForModelConfig adds required environment variables for a model config.
+// It checks custom providers first, then built-in aliases, then hardcoded fallbacks.
+func addEnvVarsForModelConfig(model *latest.ModelConfig, customProviders map[string]latest.ProviderConfig, requiredEnv map[string]bool) {
+	if model.TokenKey != "" {
+		requiredEnv[model.TokenKey] = true
+	} else if customProviders != nil {
+		// Check custom providers from config
+		if provCfg, exists := customProviders[model.Provider]; exists {
+			if provCfg.TokenKey != "" {
+				requiredEnv[provCfg.TokenKey] = true
+			}
+		}
+	} else if alias, exists := provider.Aliases[model.Provider]; exists {
+		// Check built-in aliases
+		if alias.TokenEnvVar != "" {
+			requiredEnv[alias.TokenEnvVar] = true
+		}
+	} else {
+		// Fallback to hardcoded mappings for unknown providers
+		switch model.Provider {
+		case "openai":
+			requiredEnv["OPENAI_API_KEY"] = true
+		case "anthropic":
+			requiredEnv["ANTHROPIC_API_KEY"] = true
+		case "google":
+			if model.ProviderOpts["project"] == nil && model.ProviderOpts["location"] == nil {
+				requiredEnv["GOOGLE_API_KEY"] = true
+			}
+		case "mistral":
+			requiredEnv["MISTRAL_API_KEY"] = true
+		}
+	}
 }
 
 func GatherEnvVarsForTools(ctx context.Context, cfg *latest.Config) ([]string, error) {
 	requiredEnv := map[string]bool{}
 	var errs []error
 
-	for _, ref := range gatherMCPServerReferences(cfg) {
-		mcpServerName := gateway.ParseServerRef(ref)
-
-		secrets, err := gateway.RequiredEnvVars(ctx, mcpServerName)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("reading which secrets the MCP server needs for %s: %w", ref, err))
-			continue
-		}
-
-		for _, secret := range secrets {
-			requiredEnv[secret.Env] = true
-		}
-	}
-
-	if len(errs) > 0 {
-		return mcpToSortedList(requiredEnv), fmt.Errorf("tool env preflight: %w", errors.Join(errs...))
-	}
-	return mcpToSortedList(requiredEnv), nil
-}
-
-func gatherMCPServerReferences(cfg *latest.Config) []string {
-	servers := map[string]bool{}
-
 	for i := range cfg.Agents {
 		agent := cfg.Agents[i]
+
 		for j := range agent.Toolsets {
 			toolSet := agent.Toolsets[j]
+			ref := toolSet.Ref
+			if toolSet.Type != "mcp" || ref == "" {
+				continue
+			}
 
-			if toolSet.Type == "mcp" && toolSet.Ref != "" {
-				servers[toolSet.Ref] = true
+			mcpServerName := gateway.ParseServerRef(ref)
+			secrets, err := gateway.RequiredEnvVars(ctx, mcpServerName)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("reading which secrets the MCP server needs for %s: %w", ref, err))
+				continue
+			}
+
+			for _, secret := range secrets {
+				value, ok := toolSet.Env[secret.Env]
+				if !ok {
+					requiredEnv[secret.Env] = true
+				} else {
+					os.Expand(value, func(name string) string {
+						requiredEnv[name] = true
+						return ""
+					})
+				}
 			}
 		}
 	}
 
-	var list []string
-	for e := range servers {
-		list = append(list, e)
+	if len(errs) > 0 {
+		return sortedKeys(requiredEnv), fmt.Errorf("tool env preflight: %w", errors.Join(errs...))
 	}
-	sort.Strings(list)
-
-	return list
+	return sortedKeys(requiredEnv), nil
 }
 
-func mcpToSortedList(requiredEnv map[string]bool) []string {
-	var requiredEnvList []string
-
-	for e := range requiredEnv {
-		requiredEnvList = append(requiredEnvList, e)
-	}
-	sort.Strings(requiredEnvList)
-
-	return requiredEnvList
+func sortedKeys(requiredEnv map[string]bool) []string {
+	return slices.Sorted(maps.Keys(requiredEnv))
 }

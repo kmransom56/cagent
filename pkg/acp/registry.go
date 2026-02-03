@@ -5,8 +5,7 @@ import (
 	"os"
 
 	"github.com/docker/cagent/pkg/config"
-	latest "github.com/docker/cagent/pkg/config/v2"
-	"github.com/docker/cagent/pkg/environment"
+	"github.com/docker/cagent/pkg/config/latest"
 	"github.com/docker/cagent/pkg/teamloader"
 	"github.com/docker/cagent/pkg/tools"
 )
@@ -15,8 +14,8 @@ import (
 func createToolsetRegistry(agent *Agent) *teamloader.ToolsetRegistry {
 	registry := teamloader.NewDefaultToolsetRegistry()
 
-	registry.Register("filesystem", func(ctx context.Context, toolset latest.Toolset, parentDir string, envProvider environment.Provider, runtimeConfig config.RuntimeConfig) (tools.ToolSet, error) {
-		wd := runtimeConfig.WorkingDir
+	registry.Register("filesystem", func(ctx context.Context, toolset latest.Toolset, parentDir string, runConfig *config.RuntimeConfig) (tools.ToolSet, error) {
+		wd := runConfig.WorkingDir
 		if wd == "" {
 			var err error
 			wd, err = os.Getwd()

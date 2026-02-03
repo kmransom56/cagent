@@ -4,8 +4,8 @@ import (
 	"context"
 	"log/slog"
 	"os"
-	"path/filepath"
-	"strings"
+
+	"github.com/docker/cagent/pkg/path"
 )
 
 type RunSecretsProvider struct {
@@ -18,15 +18,24 @@ func NewRunSecretsProvider() *RunSecretsProvider {
 	}
 }
 
-func (p *RunSecretsProvider) Get(_ context.Context, name string) string {
-	path := filepath.Join(p.root, name)
-
-	buf, err := os.ReadFile(path)
+func (p *RunSecretsProvider) Get(_ context.Context, name string) (string, bool) {
+	// Validate the secret name to prevent path traversal
+	validatedPath, err := path.ValidatePathInDirectory(name, p.root)
 	if err != nil {
-		// Ignore error
-		slog.Debug("Failed to find secret in /run/secrets", "error", err)
-		return ""
+		slog.Debug("Invalid secret name", "name", name, "error", err)
+		return "", false
 	}
 
-	return strings.Split(string(buf), "\n")[0]
+	buf, err := os.ReadFile(validatedPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", false
+		}
+
+		// Ignore error
+		slog.Debug("Failed to find secret in /run/secrets", "error", err)
+		return "", false
+	}
+
+	return string(buf), true
 }

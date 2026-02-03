@@ -2,7 +2,6 @@ package builtin
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -14,17 +13,19 @@ import (
 const (
 	ToolNameCreateTodo  = "create_todo"
 	ToolNameCreateTodos = "create_todos"
-	ToolNameUpdateTodo  = "update_todo"
+	ToolNameUpdateTodos = "update_todos"
 	ToolNameListTodos   = "list_todos"
 )
 
 type TodoTool struct {
-	tools.ElicitationTool
 	handler *todoHandler
 }
 
-// Make sure Todo Tool implements the ToolSet Interface
-var _ tools.ToolSet = (*TodoTool)(nil)
+// Verify interface compliance
+var (
+	_ tools.ToolSet      = (*TodoTool)(nil)
+	_ tools.Instructable = (*TodoTool)(nil)
+)
 
 type Todo struct {
 	ID          string `json:"id" jsonschema:"ID of the todo item"`
@@ -40,13 +41,17 @@ type CreateTodosArgs struct {
 	Descriptions []string `json:"descriptions" jsonschema:"Descriptions of the todo items"`
 }
 
-type UpdateTodoArgs struct {
+type TodoUpdate struct {
 	ID     string `json:"id" jsonschema:"ID of the todo item"`
 	Status string `json:"status" jsonschema:"New status (pending, in-progress,completed)"`
 }
 
+type UpdateTodosArgs struct {
+	Updates []TodoUpdate `json:"updates" jsonschema:"List of todo updates"`
+}
+
 type todoHandler struct {
-	todos *concurrent.Map[string, Todo]
+	todos *concurrent.Slice[Todo]
 }
 
 var NewSharedTodoTool = sync.OnceValue(NewTodoTool)
@@ -54,7 +59,7 @@ var NewSharedTodoTool = sync.OnceValue(NewTodoTool)
 func NewTodoTool() *TodoTool {
 	return &TodoTool{
 		handler: &todoHandler{
-			todos: concurrent.NewMap[string, Todo](),
+			todos: concurrent.NewSlice[Todo](),
 		},
 	}
 }
@@ -80,86 +85,118 @@ IMPORTANT: You MUST use these tools to track the progress of your tasks:
 This toolset is REQUIRED for maintaining task state and ensuring all steps are completed.`
 }
 
-func (h *todoHandler) createTodo(_ context.Context, toolCall tools.ToolCall) (*tools.ToolCallResult, error) {
-	var params CreateTodoArgs
-	if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &params); err != nil {
-		return nil, fmt.Errorf("invalid arguments: %w", err)
-	}
-
+func (h *todoHandler) createTodo(_ context.Context, params CreateTodoArgs) (*tools.ToolCallResult, error) {
 	id := fmt.Sprintf("todo_%d", h.todos.Length()+1)
-	h.todos.Store(id, Todo{
+	todo := Todo{
 		ID:          id,
 		Description: params.Description,
 		Status:      "pending",
-	})
+	}
+	h.todos.Append(todo)
 
 	return &tools.ToolCallResult{
 		Output: fmt.Sprintf("Created todo [%s]: %s", id, params.Description),
+		Meta:   h.todos.All(),
 	}, nil
 }
 
-func (h *todoHandler) createTodos(_ context.Context, toolCall tools.ToolCall) (*tools.ToolCallResult, error) {
-	var params CreateTodosArgs
-	if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &params); err != nil {
-		return nil, fmt.Errorf("invalid arguments: %w", err)
-	}
-
-	ids := make([]string, len(params.Descriptions))
+func (h *todoHandler) createTodos(_ context.Context, params CreateTodosArgs) (*tools.ToolCallResult, error) {
 	start := h.todos.Length()
 	for i, desc := range params.Descriptions {
 		id := fmt.Sprintf("todo_%d", start+i+1)
-		h.todos.Store(id, Todo{
+		h.todos.Append(Todo{
 			ID:          id,
 			Description: desc,
 			Status:      "pending",
 		})
-		ids[i] = id
 	}
 
-	output := fmt.Sprintf("Created %d todos: ", len(params.Descriptions))
-	for i, id := range ids {
+	var output strings.Builder
+	fmt.Fprintf(&output, "Created %d todos: ", len(params.Descriptions))
+	for i := range params.Descriptions {
 		if i > 0 {
-			output += ", "
+			output.WriteString(", ")
 		}
-		output += fmt.Sprintf("[%s]", id)
+		fmt.Fprintf(&output, "[todo_%d]", start+i+1)
 	}
 
 	return &tools.ToolCallResult{
-		Output: output,
+		Output: output.String(),
+		Meta:   h.todos.All(),
 	}, nil
 }
 
-func (h *todoHandler) updateTodo(_ context.Context, toolCall tools.ToolCall) (*tools.ToolCallResult, error) {
-	var params UpdateTodoArgs
-	if err := json.Unmarshal([]byte(toolCall.Function.Arguments), &params); err != nil {
-		return nil, fmt.Errorf("invalid arguments: %w", err)
+func (h *todoHandler) updateTodos(_ context.Context, params UpdateTodosArgs) (*tools.ToolCallResult, error) {
+	var notFound []string
+	var updated []string
+
+	for _, update := range params.Updates {
+		_, idx := h.todos.Find(func(t Todo) bool { return t.ID == update.ID })
+		if idx == -1 {
+			notFound = append(notFound, update.ID)
+			continue
+		}
+
+		h.todos.Update(idx, func(t Todo) Todo {
+			t.Status = update.Status
+			return t
+		})
+		updated = append(updated, fmt.Sprintf("%s -> %s", update.ID, update.Status))
 	}
 
-	todo, exists := h.todos.Load(params.ID)
-	if !exists {
-		return nil, fmt.Errorf("todo [%s] not found", params.ID)
+	var output strings.Builder
+	if len(updated) > 0 {
+		fmt.Fprintf(&output, "Updated %d todos: %s", len(updated), strings.Join(updated, ", "))
+	}
+	if len(notFound) > 0 {
+		if output.Len() > 0 {
+			output.WriteString("; ")
+		}
+		fmt.Fprintf(&output, "Not found: %s", strings.Join(notFound, ", "))
 	}
 
-	todo.Status = params.Status
-	h.todos.Store(params.ID, todo)
+	if len(notFound) > 0 && len(updated) == 0 {
+		return tools.ResultError(output.String()), nil
+	}
+
+	// Clear all todos if all are completed
+	if h.allCompleted() {
+		h.todos.Clear()
+	}
 
 	return &tools.ToolCallResult{
-		Output: fmt.Sprintf("Updated todo [%s] to status: [%s]", params.ID, params.Status),
+		Output: output.String(),
+		Meta:   h.todos.All(),
 	}, nil
 }
 
-func (h *todoHandler) listTodos(context.Context, tools.ToolCall) (*tools.ToolCallResult, error) {
+func (h *todoHandler) allCompleted() bool {
+	if h.todos.Length() == 0 {
+		return false
+	}
+	allDone := true
+	h.todos.Range(func(_ int, todo Todo) bool {
+		if todo.Status != "completed" {
+			allDone = false
+			return false
+		}
+		return true
+	})
+	return allDone
+}
+
+func (h *todoHandler) listTodos(_ context.Context, _ tools.ToolCall) (*tools.ToolCallResult, error) {
 	var output strings.Builder
 	output.WriteString("Current todos:\n")
 
-	h.todos.Range(func(_ string, todo Todo) bool {
-		output.WriteString(fmt.Sprintf("- [%s] %s (Status: %s)\n",
-			todo.ID, todo.Description, todo.Status))
+	h.todos.Range(func(_ int, todo Todo) bool {
+		fmt.Fprintf(&output, "- [%s] %s (Status: %s)\n", todo.ID, todo.Description, todo.Status)
 		return true
 	})
 
 	return &tools.ToolCallResult{
 		Output: output.String(),
+		Meta:   h.todos.All(),
 	}, nil
 }
 
@@ -171,7 +208,7 @@ func (t *TodoTool) Tools(context.Context) ([]tools.Tool, error) {
 			Description:  "Create a new todo item with a description",
 			Parameters:   tools.MustSchemaFor[CreateTodoArgs](),
 			OutputSchema: tools.MustSchemaFor[string](),
-			Handler:      t.handler.createTodo,
+			Handler:      tools.NewHandler(t.handler.createTodo),
 			Annotations: tools.ToolAnnotations{
 				Title:        "Create TODO",
 				ReadOnlyHint: true, // Technically not read-only but has practically no destructive side effects.
@@ -183,21 +220,21 @@ func (t *TodoTool) Tools(context.Context) ([]tools.Tool, error) {
 			Description:  "Create a list of new todo items with descriptions",
 			Parameters:   tools.MustSchemaFor[CreateTodosArgs](),
 			OutputSchema: tools.MustSchemaFor[string](),
-			Handler:      t.handler.createTodos,
+			Handler:      tools.NewHandler(t.handler.createTodos),
 			Annotations: tools.ToolAnnotations{
 				Title:        "Create TODOs",
 				ReadOnlyHint: true, // Technically not read-only but has practically no destructive side effects.
 			},
 		},
 		{
-			Name:         ToolNameUpdateTodo,
+			Name:         ToolNameUpdateTodos,
 			Category:     "todo",
-			Description:  "Update the status of a todo item",
-			Parameters:   tools.MustSchemaFor[UpdateTodoArgs](),
+			Description:  "Update the status of one or more todo item(s)",
+			Parameters:   tools.MustSchemaFor[UpdateTodosArgs](),
 			OutputSchema: tools.MustSchemaFor[string](),
-			Handler:      t.handler.updateTodo,
+			Handler:      tools.NewHandler(t.handler.updateTodos),
 			Annotations: tools.ToolAnnotations{
-				Title:        "Update TODO",
+				Title:        "Update TODOs",
 				ReadOnlyHint: true, // Technically not read-only but has practically no destructive side effects.
 			},
 		},
@@ -213,12 +250,4 @@ func (t *TodoTool) Tools(context.Context) ([]tools.Tool, error) {
 			},
 		},
 	}, nil
-}
-
-func (t *TodoTool) Start(context.Context) error {
-	return nil
-}
-
-func (t *TodoTool) Stop(context.Context) error {
-	return nil
 }

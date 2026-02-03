@@ -9,7 +9,7 @@ import (
 	"syscall"
 
 	"github.com/docker/cagent/pkg/agent"
-	latest "github.com/docker/cagent/pkg/config/v2"
+	"github.com/docker/cagent/pkg/config/latest"
 	"github.com/docker/cagent/pkg/environment"
 	"github.com/docker/cagent/pkg/model/provider/openai"
 	"github.com/docker/cagent/pkg/runtime"
@@ -40,9 +40,7 @@ func addNumbers(_ context.Context, toolCall tools.ToolCall) (*tools.ToolCallResu
 
 	fmt.Println("Adding numbers", p.A, p.B)
 
-	return &tools.ToolCallResult{
-		Output: fmt.Sprintf("%d", p.A+p.B),
-	}, nil
+	return tools.ResultSuccess(fmt.Sprintf("%d", p.A+p.B)), nil
 }
 
 func run(ctx context.Context) error {
@@ -80,7 +78,7 @@ func run(ctx context.Context) error {
 		return err
 	}
 
-	sess := session.New(session.WithUserMessage("", "What is 1 + 2?"))
+	sess := session.New(session.WithUserMessage("What is 1 + 2?"))
 
 	messages, err := rt.Run(ctx, sess)
 	if err != nil {

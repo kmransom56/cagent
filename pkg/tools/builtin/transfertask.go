@@ -8,11 +8,8 @@ import (
 
 const ToolNameTransferTask = "transfer_task"
 
-type TransferTaskTool struct {
-	tools.ElicitationTool
-}
+type TransferTaskTool struct{}
 
-// Make sure Transfer Tool implements the ToolSet Interface
 var _ tools.ToolSet = (*TransferTaskTool)(nil)
 
 type TransferTaskArgs struct {
@@ -23,10 +20,6 @@ type TransferTaskArgs struct {
 
 func NewTransferTaskTool() *TransferTaskTool {
 	return &TransferTaskTool{}
-}
-
-func (t *TransferTaskTool) Instructions() string {
-	return ""
 }
 
 func (t *TransferTaskTool) Tools(context.Context) ([]tools.Tool, error) {
@@ -43,12 +36,4 @@ func (t *TransferTaskTool) Tools(context.Context) ([]tools.Tool, error) {
 			},
 		},
 	}, nil
-}
-
-func (t *TransferTaskTool) Start(context.Context) error {
-	return nil
-}
-
-func (t *TransferTaskTool) Stop(context.Context) error {
-	return nil
 }
