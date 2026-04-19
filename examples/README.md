@@ -17,6 +17,7 @@ Some of these agents use [built-in tools](../docs/USAGE.md#tool-configuration) l
 | [script_shell.yaml](script_shell.yaml) | Agent with custom shell commands       |            | ✓     |      |       |        |             |            |
 | [mem.yaml](mem.yaml)                   | Humorous AI with persistent memory     | ✓          |       |      |       | ✓      |             |            |
 | [diag.yaml](diag.yaml)                 | Log analysis and diagnostics           | ✓          | ✓     |      | ✓     |        |             |            |
+| [document_analysis.yaml](document_analysis.yaml) | Analyze docs and build task plans | ✓          |       |      | ✓     |        | document_analysis (builtin) |            |
 | [todo.yaml](todo.yaml)                 | Task manager example                   |            |       | ✓    |       |        |             |            |
 | [pythonista.yaml](pythonista.yaml)     | Python programming assistant           | ✓          | ✓     |      |       |        |             |            |
 | [fetch_docker.yaml](fetch_docker.yaml) | Web content fetcher and summarizer     |            |       |      |       |        | fetch (builtin) |        |

@@ -967,6 +967,7 @@ Included in `cagent` are a series of built-in tools that can greatly enhance the
 ```yaml
 toolsets:
   - type: filesystem # Grants the agent filesystem access
+  - type: document_analysis # Reads text or PDF documents and returns a structured plan
   - type: think # Enables the think tool
   - type: todo # Enable the todo list tool
     shared: boolean # Should the todo list be shared between agents (optional)
@@ -1013,6 +1014,61 @@ agents:
         path: "./agent_memory.db"
 ```
 
+### Document Analysis Tool
+
+The document analysis tool reads text files and PDFs natively and returns a deterministic execution plan with objectives, risks, recommended agent roles, and a concrete task list.
+
+```yaml
+agents:
+  root:
+    # ... other config
+    toolsets:
+      - type: document_analysis
+      - type: filesystem
+```
+
+The tool is exposed to the agent as `analyze_document` and accepts:
+
+- `path`: path to the source document
+- `goal`: optional instruction that biases the generated plan toward a particular outcome
+
+See `examples/document_analysis.yaml` for a complete configuration.
+
+### Windows, WSL, and container path remapping
+
+Document reads now use a shared path resolver before opening files. This applies to `analyze_document`, filesystem reads such as `read_file` and `read_multiple_files`, and RAG document paths.
+
+Path resolution rules:
+
+- Relative paths are resolved from the current working directory.
+- Native absolute paths are used as-is when they already match the current runtime.
+- When a non-Windows runtime receives a Windows-style absolute path such as `C:\Users\you\project\docs\plan.pdf`, `cagent` tries these remaps in order:
+- `CAGENT_PATH_MAP` mappings
+- workspace remapping when the current working directory matches part of the Windows path
+- WSL mount translation such as `/mnt/c/Users/you/project/docs/plan.pdf`
+
+If one of those candidates already exists, it is preferred automatically.
+
+Use `CAGENT_PATH_MAP` when the path visible from the host differs from the path visible to `cagent` inside WSL, a container, or a remote runtime.
+
+Examples:
+
+```powershell
+$env:CAGENT_PATH_MAP = "C:\Users\Keith\src\cagent=/workspace/cagent;D:\Shared=/mnt/d/Shared"
+```
+
+```bash
+export CAGENT_PATH_MAP='C:\Users\Keith\src\cagent=/workspace/cagent;D:\Shared=/mnt/d/Shared'
+```
+
+Each entry is `host_path=runtime_path`, and multiple entries are separated by semicolons.
+
+Common cases:
+
+- Windows host path to Docker bind mount: `C:\Users\Keith\src\cagent=/workspace/cagent`
+- Windows host path to WSL path: `C:\Users\Keith\src\cagent=/mnt/c/Users/Keith/src/cagent`
+- Shared drive path to mounted volume: `D:\Shared=/data/shared`
+
 ### Task Transfer Tool
 
 All agents automatically have access to the task transfer tool, which allows
@@ -1052,6 +1108,8 @@ agents:
       Use the knowledge base to gather context before answering user questions
     rag: [my_docs]  # Reference the RAG source
 ```
+
+When your config is authored on Windows but `cagent` runs in WSL or a container, the `docs:` paths also go through the same document path resolver described above. If the Windows path is not directly visible from the runtime, define `CAGENT_PATH_MAP` so the configured documents resolve to the mounted runtime path.
 
 ### Retrieval Strategies
 

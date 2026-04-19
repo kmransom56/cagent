@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"os"
 	"path/filepath"
 	"time"
 
@@ -580,10 +579,12 @@ func (m *Manager) readFile(path string) (string, error) {
 func GetAbsolutePaths(basePath string, docPaths []string) []string {
 	var absPaths []string
 	for _, p := range docPaths {
-		if filepath.IsAbs(p) {
-			absPaths = append(absPaths, p)
+		resolution := docreader.ResolvePath("", p)
+		candidate := resolution.ResolvedPath
+		if filepath.IsAbs(candidate) {
+			absPaths = append(absPaths, candidate)
 		} else {
-			absPaths = append(absPaths, filepath.Join(basePath, p))
+			absPaths = append(absPaths, filepath.Join(basePath, candidate))
 		}
 	}
 	return absPaths

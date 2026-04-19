@@ -311,11 +311,7 @@ func (t *FilesystemTool) executePostEditCommands(ctx context.Context, filePath s
 // Relative paths (including ".") are joined with the working directory.
 // Absolute paths and paths starting with ".." are used as-is.
 func (t *FilesystemTool) resolvePath(path string) string {
-	if filepath.IsAbs(path) {
-		return filepath.Clean(path)
-	}
-
-	return filepath.Clean(filepath.Join(t.workingDir, path))
+	return docreader.ResolvePath(t.workingDir, path).ResolvedPath
 }
 
 // initGitignoreMatcher initializes the gitignore matcher for the working directory.

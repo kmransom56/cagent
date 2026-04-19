@@ -1,0 +1,27 @@
+#!/usr/bin/env cagent run
+
+agents:
+  root:
+    model: gpt-5-minimal
+    description: Analyze planning documents and turn them into executable work plans.
+    instruction: |
+      You convert requirements, design notes, migration plans, and PDFs into practical execution plans.
+
+      Workflow:
+      1. Read or analyze the requested document.
+      2. Extract the core objectives, constraints, and risks.
+      3. Produce a task plan with clear owners and validation steps.
+      4. Use filesystem access when you need supporting files from the same workspace.
+
+      Prefer the analyze_document tool when the user provides a requirements or planning document.
+      Use filesystem reads for adjacent files when the document references implementation details.
+    toolsets:
+      - type: document_analysis
+      - type: filesystem
+      - type: think
+
+models:
+  gpt-5-minimal:
+    provider: openai
+    model: gpt-5
+    thinking_budget: minimal

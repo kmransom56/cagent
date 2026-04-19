@@ -64,6 +64,7 @@ func NewDefaultToolsetRegistry() *ToolsetRegistry {
 	r.Register("shell", createShellTool)
 	r.Register("script", createScriptTool)
 	r.Register("filesystem", createFilesystemTool)
+	r.Register("document_analysis", createDocumentAnalysisTool)
 	r.Register("fetch", createFetchTool)
 	r.Register("mcp", createMCPTool)
 	r.Register("api", createAPITool)
@@ -188,6 +189,19 @@ func createFilesystemTool(_ context.Context, toolset latest.Toolset, _ string, r
 	}
 
 	return builtin.NewFilesystemTool(wd, opts...), nil
+}
+
+func createDocumentAnalysisTool(_ context.Context, _ latest.Toolset, _ string, runConfig *config.RuntimeConfig) (tools.ToolSet, error) {
+	wd := runConfig.WorkingDir
+	if wd == "" {
+		var err error
+		wd, err = os.Getwd()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get working directory: %w", err)
+		}
+	}
+
+	return builtin.NewDocumentAnalysisTool(wd), nil
 }
 
 func createAPITool(ctx context.Context, toolset latest.Toolset, _ string, runConfig *config.RuntimeConfig) (tools.ToolSet, error) {
