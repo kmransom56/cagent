@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/docker/cagent/pkg/docreader"
 	"github.com/docker/cagent/pkg/rag/database"
 	"github.com/docker/cagent/pkg/rag/fusion"
 	"github.com/docker/cagent/pkg/rag/rerank"
@@ -568,11 +569,11 @@ func (m *Manager) reconstructFullDocuments(_ context.Context, results []database
 
 // readFile reads the content of a file
 func (m *Manager) readFile(path string) (string, error) {
-	data, err := os.ReadFile(path)
+	data, err := docreader.ReadText(path)
 	if err != nil {
 		return "", fmt.Errorf("failed to read file %s: %w", path, err)
 	}
-	return string(data), nil
+	return data, nil
 }
 
 // GetAbsolutePaths converts doc paths to absolute paths

@@ -1,16 +1,15 @@
 package builtin
 
 import (
-	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"os/exec"
 	"slices"
 	"strings"
 
 	"github.com/docker/cagent/pkg/config/latest"
+	"github.com/docker/cagent/pkg/shellutil"
 	"github.com/docker/cagent/pkg/tools"
 )
 
@@ -139,10 +138,8 @@ func (t *ScriptShellTool) execute(ctx context.Context, toolConfig *latest.Script
 		}
 	}
 
-	// Use default shell
-	shell := cmp.Or(os.Getenv("SHELL"), "/bin/sh")
-
-	cmd := exec.CommandContext(ctx, shell, "-c", toolConfig.Cmd)
+	commandShell := shellutil.DetectCommandShell()
+	cmd := exec.CommandContext(ctx, commandShell.Path, append(commandShell.ArgsPrefix, toolConfig.Cmd)...)
 	cmd.Dir = toolConfig.WorkingDir
 	cmd.Env = t.env
 	for key, value := range params {

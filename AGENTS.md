@@ -1031,3 +1031,72 @@ task push-image    # Build and push multi-platform
 | `Taskfile.yml` | Build automation tasks |
 | `.golangci.yml` | Linter configuration |
 | `cagent-schema.json` | JSON schema for config validation |
+
+---
+
+## CRITICAL — Windows PowerShell Shell Rules
+
+**This machine runs Windows with PowerShell as the default shell.** All shell commands MUST use PowerShell syntax. Never assume bash/Unix conventions.
+
+### NEVER Use Heredoc Syntax
+
+Heredoc (`<<'EOF'` ... `EOF`) is a bash-only construct. It **does not work in PowerShell** and will fail silently or throw parse errors. Do not attempt it. Do not debug it. Use the alternatives below instead.
+
+### Git Commits — No Heredoc
+
+```powershell
+# WRONG — will fail in PowerShell
+git commit -m "$(cat <<'EOF'
+Some message
+EOF
+)"
+
+# CORRECT — simple single-line
+git commit -m "Fix the triage endpoint validation"
+
+# CORRECT — multi-line with backtick line continuation
+git commit -m "Fix the triage endpoint validation`n`nAdded null check for device parameter"
+
+# CORRECT — use a temp file for long messages
+"Fix the triage endpoint`n`nDetails here" | Out-File -Encoding utf8 .git-msg.tmp
+git commit -F .git-msg.tmp
+Remove-Item .git-msg.tmp
+```
+
+### Multi-Line Strings in PowerShell
+
+```powershell
+# Use here-strings (PowerShell native — NOT the same as bash heredoc)
+$msg = @"
+Line one
+Line two
+"@
+
+# Or backtick-n for inline newlines
+$msg = "Line one`nLine two"
+```
+
+### Common Bash-isms That Fail in PowerShell
+
+| Bash | PowerShell Equivalent |
+|------|----------------------|
+| `ls -la` | `Get-ChildItem` or `dir` |
+| `cat file.txt` | `Get-Content file.txt` |
+| `grep "pattern" file` | `Select-String -Pattern "pattern" -Path file` or use `rg` |
+| `export VAR=value` | `$env:VAR = "value"` |
+| `VAR=value command` | `$env:VAR = "value"; command` |
+| `command1 && command2` | `command1; if ($LASTEXITCODE -eq 0) { command2 }` |
+| `command > /dev/null 2>&1` | `command *> $null` |
+| `find . -name "*.py"` | `Get-ChildItem -Recurse -Filter "*.py"` or use `rg --files` |
+| `which command` | `Get-Command command` |
+| `chmod +x script.sh` | Not applicable on Windows |
+| `sleep 5` | `Start-Sleep -Seconds 5` |
+
+### General PowerShell Rules
+
+- Always assume **PowerShell** unless explicitly told otherwise.
+- Never spend time debugging heredoc failures — just rewrite using the patterns above.
+- Use `rg` (ripgrep) for searching — it works cross-platform and is faster than both `grep` and `Select-String`.
+- When chaining commands, prefer `;` over `&&` — PowerShell does not short-circuit with `&&` in older versions.
+- Quote file paths with double quotes when they contain spaces.
+- Use `$LASTEXITCODE` to check exit status of native commands, not `$?` (which only reflects PowerShell cmdlet success).

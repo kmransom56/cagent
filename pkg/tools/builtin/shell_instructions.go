@@ -1,7 +1,9 @@
 package builtin
 
-// nativeInstructions contains the usage guide for native shell mode.
-const nativeInstructions = `# Shell Tool Usage Guide
+import "runtime"
+
+func nativeInstructions() string {
+	base := `# Shell Tool Usage Guide
 
 Execute shell commands in the user's environment with full control over working directories and command parameters.
 
@@ -34,9 +36,9 @@ On Unix-like systems, ${SHELL} is used or /bin/sh as fallback.
 - Leverage the "cwd" parameter for directory-specific commands, rather than cding within commands
 - Quote arguments containing spaces or special characters
 - Use pipes and redirections
-- Write advanced scripts with heredocs, that replace a lot of simple commands or tool calls
+- Use shell-native multiline constructs when a one-liner becomes unreadable
 - This tool is great at reading and writing multiple files at once
-- Avoid writing shell scripts to the disk. Instead, use heredocs to pipe the script to the SHELL
+- Avoid writing temporary shell scripts to disk unless the workflow clearly benefits from it
 - Use the timeout parameter for long-running operations (e.g., builds, tests)
 
 ### Git Commits
@@ -49,7 +51,7 @@ When user asks to create git commit
 ## Usage Examples
 
 **Basic command execution:**
-{ "cmd": "ls -la", "cwd": "." }
+{ "cmd": "git status", "cwd": "." }
 
 **Long-running command with custom timeout:**
 { "cmd": "npm run build", "cwd": ".", "timeout": 120 }
@@ -60,8 +62,8 @@ When user asks to create git commit
 { "cmd": "python -m pytest tests/", "cwd": "backend", "timeout": 90 }
 
 **File operations:**
-{ "cmd": "find . -name '*.go' -type f", "cwd": "." }
-{ "cmd": "grep -r 'TODO' src/", "cwd": "." }
+{ "cmd": "rg --files", "cwd": "." }
+{ "cmd": "rg 'TODO' src", "cwd": "." }
 
 **Process management:**
 { "cmd": "ps aux | grep node", "cwd": "." }
@@ -69,11 +71,6 @@ When user asks to create git commit
 
 **Complex pipelines:**
 { "cmd": "cat package.json | jq '.dependencies'", "cwd": "frontend" }
-
-**Bash scripts:**
-{ "cmd": "cat << 'EOF' | ${SHELL}
-echo Hello
-EOF" }
 
 ## Error Handling
 
@@ -166,3 +163,22 @@ Use list_background_jobs to see all jobs with their status
 3. Perform tasks: use other tools while services run
 4. Check logs: view_background_job to see service output
 5. Cleanup: stop_background_job for each service (or let agent cleanup automatically)`
+
+	if runtime.GOOS == "windows" {
+		return base + `
+
+## Windows Notes
+
+- Prefer PowerShell syntax and PowerShell-native commands when running on Windows.
+- Do not use bash heredocs such as <<'EOF'; use PowerShell here-strings instead.
+- Prefer ';' over '&&' for command chaining when compatibility matters.
+- Use $LASTEXITCODE to inspect native command exit status in PowerShell.
+
+**PowerShell examples:**
+{ "cmd": "Get-ChildItem", "cwd": "." }
+{ "cmd": "$msg = @\"\nhello\n\"@; $msg", "cwd": "." }
+{ "cmd": "git status; if ($LASTEXITCODE -eq 0) { git diff --stat }", "cwd": "." }`
+	}
+
+	return base
+}

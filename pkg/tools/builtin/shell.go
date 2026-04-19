@@ -2,12 +2,10 @@ package builtin
 
 import (
 	"bytes"
-	"cmp"
 	"context"
 	"fmt"
 	"os"
 	"os/exec"
-	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,6 +14,7 @@ import (
 	"github.com/docker/cagent/pkg/concurrent"
 	"github.com/docker/cagent/pkg/config"
 	"github.com/docker/cagent/pkg/config/latest"
+	"github.com/docker/cagent/pkg/shellutil"
 	"github.com/docker/cagent/pkg/tools"
 )
 
@@ -363,21 +362,8 @@ func detectShell(sandboxMode bool) (shell string, argsPrefix []string) {
 		return "/bin/sh", []string{"-c"}
 	}
 
-	if runtime.GOOS == "windows" {
-		return detectWindowsShell()
-	}
-
-	return cmp.Or(os.Getenv("SHELL"), "/bin/sh"), []string{"-c"}
-}
-
-func detectWindowsShell() (shell string, argsPrefix []string) {
-	powershellArgs := []string{"-NoProfile", "-NonInteractive", "-Command"}
-	for _, ps := range []string{"pwsh.exe", "powershell.exe"} {
-		if path, err := exec.LookPath(ps); err == nil {
-			return path, powershellArgs
-		}
-	}
-	return cmp.Or(os.Getenv("ComSpec"), "cmd.exe"), []string{"/C"}
+	commandShell := shellutil.DetectCommandShell()
+	return commandShell.Path, commandShell.ArgsPrefix
 }
 
 // resolveWorkDir returns the effective working directory.
@@ -403,19 +389,23 @@ func formatCommandOutput(timeoutCtx, ctx context.Context, err error, rawOutput s
 			output = fmt.Sprintf("Error executing command: %s\nOutput: %s", err, output)
 		}
 	}
-	return cmp.Or(strings.TrimSpace(output), "<no output>")
+	trimmed := strings.TrimSpace(output)
+	if trimmed == "" {
+		return "<no output>"
+	}
+	return trimmed
 }
 
 func (t *ShellTool) Instructions() string {
 	if t.handler.sandbox != nil {
 		return t.buildSandboxInstructions()
 	}
-	return nativeInstructions
+	return nativeInstructions()
 }
 
 // buildSandboxInstructions returns the native instructions with a note about Linux sandboxing.
 func (t *ShellTool) buildSandboxInstructions() string {
-	return "**Note:** For sandboxing reasons, all shell commands run inside a Linux container.\n\n" + nativeInstructions
+	return "**Note:** For sandboxing reasons, all shell commands run inside a Linux container.\n\n" + nativeInstructions()
 }
 
 func (t *ShellTool) Tools(context.Context) ([]tools.Tool, error) {

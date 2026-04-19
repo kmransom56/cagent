@@ -13,7 +13,9 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/docker/cagent/pkg/docreader"
 	"github.com/docker/cagent/pkg/fsx"
+	"github.com/docker/cagent/pkg/shellutil"
 	"github.com/docker/cagent/pkg/tools"
 )
 
@@ -292,7 +294,8 @@ func (t *FilesystemTool) executePostEditCommands(ctx context.Context, filePath s
 			continue
 		}
 
-		cmd := exec.CommandContext(ctx, "/bin/sh", "-c", postEdit.Cmd)
+		commandShell := shellutil.DetectCommandShell()
+		cmd := exec.CommandContext(ctx, commandShell.Path, append(commandShell.ArgsPrefix, postEdit.Cmd)...)
 		cmd.Env = cmd.Environ()
 		cmd.Env = append(cmd.Env, "path="+filePath)
 
@@ -487,7 +490,7 @@ func (t *FilesystemTool) handleListDirectory(_ context.Context, args ListDirecto
 func (t *FilesystemTool) handleReadFile(_ context.Context, args ReadFileArgs) (*tools.ToolCallResult, error) {
 	resolvedPath := t.resolvePath(args.Path)
 
-	content, err := os.ReadFile(resolvedPath)
+	content, err := docreader.ReadText(resolvedPath)
 	if err != nil {
 		var errMsg string
 		if os.IsNotExist(err) {
@@ -506,9 +509,9 @@ func (t *FilesystemTool) handleReadFile(_ context.Context, args ReadFileArgs) (*
 	}
 
 	return &tools.ToolCallResult{
-		Output: string(content),
+		Output: content,
 		Meta: ReadFileMeta{
-			LineCount: strings.Count(string(content), "\n") + 1,
+			LineCount: strings.Count(content, "\n") + 1,
 		},
 	}, nil
 }
@@ -531,7 +534,7 @@ func (t *FilesystemTool) handleReadMultipleFiles(ctx context.Context, args ReadM
 
 		resolvedPath := t.resolvePath(path)
 
-		content, err := os.ReadFile(resolvedPath)
+		content, err := docreader.ReadText(resolvedPath)
 		if err != nil {
 			errMsg := err.Error()
 			if os.IsNotExist(err) {
@@ -548,10 +551,10 @@ func (t *FilesystemTool) handleReadMultipleFiles(ctx context.Context, args ReadM
 
 		contents = append(contents, PathContent{
 			Path:    path,
-			Content: string(content),
+			Content: content,
 		})
-		entry.Content = string(content)
-		entry.LineCount = strings.Count(string(content), "\n") + 1
+		entry.Content = content
+		entry.LineCount = strings.Count(content, "\n") + 1
 		meta.Files = append(meta.Files, entry)
 	}
 

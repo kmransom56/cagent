@@ -2,17 +2,16 @@ package hooks
 
 import (
 	"bytes"
-	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"os"
 	"os/exec"
 	"regexp"
-	"runtime"
 	"strings"
 	"sync"
+
+	"github.com/docker/cagent/pkg/shellutil"
 )
 
 // Executor handles the execution of hooks
@@ -64,22 +63,9 @@ func NewExecutor(config *Config, workingDir string, env []string) *Executor {
 
 // initShell initializes the shell configuration based on the OS
 func (e *Executor) initShell() {
-	if runtime.GOOS == "windows" {
-		// Prefer PowerShell when available
-		if path, err := exec.LookPath("pwsh.exe"); err == nil {
-			e.shell = path
-			e.shellArgsPrefix = []string{"-NoProfile", "-NonInteractive", "-Command"}
-		} else if path, err := exec.LookPath("powershell.exe"); err == nil {
-			e.shell = path
-			e.shellArgsPrefix = []string{"-NoProfile", "-NonInteractive", "-Command"}
-		} else {
-			e.shell = cmp.Or(os.Getenv("ComSpec"), "cmd.exe")
-			e.shellArgsPrefix = []string{"/C"}
-		}
-	} else {
-		e.shell = cmp.Or(os.Getenv("SHELL"), "/bin/sh")
-		e.shellArgsPrefix = []string{"-c"}
-	}
+	commandShell := shellutil.DetectCommandShell()
+	e.shell = commandShell.Path
+	e.shellArgsPrefix = commandShell.ArgsPrefix
 }
 
 // compileMatchers pre-compiles all matcher regex patterns

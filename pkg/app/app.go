@@ -21,6 +21,7 @@ import (
 	"github.com/docker/cagent/pkg/runtime"
 	"github.com/docker/cagent/pkg/session"
 	"github.com/docker/cagent/pkg/sessiontitle"
+	"github.com/docker/cagent/pkg/shellutil"
 	"github.com/docker/cagent/pkg/tools"
 	mcptools "github.com/docker/cagent/pkg/tools/mcp"
 	"github.com/docker/cagent/pkg/tui/messages"
@@ -318,7 +319,8 @@ func (a *App) RunWithMessage(ctx context.Context, cancel context.CancelFunc, msg
 }
 
 func (a *App) RunBangCommand(ctx context.Context, command string) {
-	out, _ := exec.CommandContext(ctx, "/bin/sh", "-c", command).CombinedOutput()
+	commandShell := shellutil.DetectCommandShell()
+	out, _ := exec.CommandContext(ctx, commandShell.Path, append(commandShell.ArgsPrefix, command)...).CombinedOutput()
 	a.events <- runtime.ShellOutput("$ " + command + "\n" + string(out))
 }
 

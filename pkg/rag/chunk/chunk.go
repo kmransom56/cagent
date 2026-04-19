@@ -7,6 +7,8 @@ import (
 	"io"
 	"os"
 	"strings"
+
+	"github.com/docker/cagent/pkg/docreader"
 )
 
 // Chunk represents a piece of text from a document
@@ -170,11 +172,11 @@ func (t *TextDocumentProcessor) isWhitespace(r rune) bool {
 
 // ProcessFile reads a file and processes it using the given document processor
 func ProcessFile(dp DocumentProcessor, path string) ([]Chunk, error) {
-	content, err := os.ReadFile(path)
+	content, err := docreader.ReadText(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read file: %w", err)
 	}
-	return dp.Process(path, content)
+	return dp.Process(path, []byte(content))
 }
 
 // FileHash calculates SHA256 hash of a file
