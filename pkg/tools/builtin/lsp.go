@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1898,9 +1899,15 @@ func (h *lspHandler) waitForDiagnostics(ctx context.Context, timeout time.Durati
 func pathToURI(path string) string {
 	absPath, err := filepath.Abs(path)
 	if err != nil {
-		return "file://" + path
+		absPath = path
 	}
-	return "file://" + absPath
+
+	normalizedPath := filepath.ToSlash(absPath)
+	if !strings.HasPrefix(normalizedPath, "/") {
+		normalizedPath = "/" + normalizedPath
+	}
+
+	return (&url.URL{Scheme: "file", Path: normalizedPath}).String()
 }
 
 func detectLanguageID(path string) string {

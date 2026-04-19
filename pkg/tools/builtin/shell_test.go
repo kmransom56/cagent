@@ -2,6 +2,9 @@ package builtin
 
 import (
 	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -14,18 +17,20 @@ import (
 
 func TestNewShellTool(t *testing.T) {
 	t.Setenv("SHELL", "/bin/bash")
+	expectedShell, _ := detectShell(false)
 	tool := NewShellTool(nil, &config.RuntimeConfig{Config: config.Config{WorkingDir: t.TempDir()}}, nil)
 
 	assert.NotNil(t, tool)
 	assert.NotNil(t, tool.handler)
-	assert.Equal(t, "/bin/bash", tool.handler.shell)
+	assert.Equal(t, expectedShell, tool.handler.shell)
 
 	t.Setenv("SHELL", "")
+	expectedShell, _ = detectShell(false)
 	tool = NewShellTool(nil, &config.RuntimeConfig{Config: config.Config{WorkingDir: t.TempDir()}}, nil)
 
 	assert.NotNil(t, tool)
 	assert.NotNil(t, tool.handler)
-	assert.Equal(t, "/bin/sh", tool.handler.shell, "Should default to /bin/sh when SHELL is not set")
+	assert.Equal(t, expectedShell, tool.handler.shell)
 }
 
 func TestShellTool_HandlerEcho(t *testing.T) {
@@ -42,15 +47,29 @@ func TestShellTool_HandlerEcho(t *testing.T) {
 func TestShellTool_HandlerWithCwd(t *testing.T) {
 	tool := NewShellTool(nil, &config.RuntimeConfig{Config: config.Config{WorkingDir: t.TempDir()}}, nil)
 	tmpDir := t.TempDir()
+	command := "pwd"
+	if runtime.GOOS == "windows" {
+		command = "(Get-Location).Path"
+	}
 
 	result, err := tool.handler.RunShell(t.Context(), RunShellArgs{
-		Cmd: "pwd",
+		Cmd: command,
 		Cwd: tmpDir,
 	})
 	require.NoError(t, err)
-	// The output might contain extra newlines or other characters,
-	// so we just check if it contains the temp dir path
-	assert.Contains(t, result.Output, tmpDir)
+
+	output := strings.TrimSpace(result.Output)
+	resolvedTmpDir, err := filepath.EvalSymlinks(tmpDir)
+	require.NoError(t, err)
+
+	assert.True(
+		t,
+		strings.Contains(output, tmpDir) || strings.Contains(output, resolvedTmpDir),
+		"expected output %q to contain %q or %q",
+		output,
+		tmpDir,
+		resolvedTmpDir,
+	)
 }
 
 func TestShellTool_HandlerError(t *testing.T) {

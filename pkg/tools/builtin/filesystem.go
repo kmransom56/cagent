@@ -3,6 +3,7 @@ package builtin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
@@ -295,9 +296,8 @@ func (t *FilesystemTool) executePostEditCommands(ctx context.Context, filePath s
 		}
 
 		commandShell := shellutil.DetectCommandShell()
-		cmd := exec.CommandContext(ctx, commandShell.Path, append(commandShell.ArgsPrefix, postEdit.Cmd)...)
+		cmd := exec.CommandContext(ctx, commandShell.Path, append(commandShell.ArgsPrefix, preparePostEditCommand(postEdit.Cmd, filePath, commandShell))...)
 		cmd.Env = cmd.Environ()
-		cmd.Env = append(cmd.Env, "path="+filePath)
 
 		if err := cmd.Run(); err != nil {
 			return fmt.Errorf("post-edit command failed for %s: %w", filePath, err)
@@ -305,6 +305,28 @@ func (t *FilesystemTool) executePostEditCommands(ctx context.Context, filePath s
 
 	}
 	return nil
+}
+
+func preparePostEditCommand(command, filePath string, shell shellutil.CommandShell) string {
+	shellName := strings.ToLower(filepath.Base(shell.Path))
+
+	switch shellName {
+	case "pwsh.exe", "powershell.exe":
+		return fmt.Sprintf("$path = %s; %s", quotePowerShellString(filePath), command)
+	case "cmd.exe":
+		expanded := strings.ReplaceAll(command, "$path", "%CAGENT_POST_EDIT_PATH%")
+		return fmt.Sprintf("set \"CAGENT_POST_EDIT_PATH=%s\" && %s", filePath, expanded)
+	default:
+		return fmt.Sprintf("path=%s; export path; %s", quotePOSIXShellString(filePath), command)
+	}
+}
+
+func quotePowerShellString(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
+}
+
+func quotePOSIXShellString(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", `'\''`) + "'"
 }
 
 // resolvePath resolves a path relative to the working directory.
@@ -489,7 +511,7 @@ func (t *FilesystemTool) handleReadFile(_ context.Context, args ReadFileArgs) (*
 	content, err := docreader.ReadText(resolvedPath)
 	if err != nil {
 		var errMsg string
-		if os.IsNotExist(err) {
+		if errors.Is(err, fs.ErrNotExist) {
 			errMsg = "not found"
 		} else {
 			errMsg = err.Error()
@@ -533,7 +555,7 @@ func (t *FilesystemTool) handleReadMultipleFiles(ctx context.Context, args ReadM
 		content, err := docreader.ReadText(resolvedPath)
 		if err != nil {
 			errMsg := err.Error()
-			if os.IsNotExist(err) {
+			if errors.Is(err, fs.ErrNotExist) {
 				errMsg = "not found"
 			}
 			contents = append(contents, PathContent{

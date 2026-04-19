@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -58,8 +59,8 @@ func TestFilesystemTool_ResolvePath(t *testing.T) {
 	assert.Equal(t, tmpDir, resolvedPath)
 
 	// Test absolute paths are allowed
-	resolvedPath = tool.resolvePath("/etc/hosts")
-	assert.Equal(t, "/etc/hosts", resolvedPath)
+	resolvedPath = tool.resolvePath(tmpDir)
+	assert.Equal(t, tmpDir, resolvedPath)
 }
 
 func TestFilesystemTool_WriteFile(t *testing.T) {
@@ -277,8 +278,11 @@ func main() {
 	postEditConfigs := []PostEditConfig{
 		{
 			Path: "*.go",
-			Cmd:  "touch $path.formatted",
+			Cmd:  `touch "$path.formatted"`,
 		},
+	}
+	if runtime.GOOS == "windows" {
+		postEditConfigs[0].Cmd = `New-Item -ItemType File -Path ($path + '.formatted') -Force | Out-Null`
 	}
 	tool := NewFilesystemTool(tmpDir, WithPostEditCommands(postEditConfigs))
 
@@ -598,6 +602,7 @@ func TestFilesystemTool_EmptyWorkingDir(t *testing.T) {
 	assert.Equal(t, "test.txt", resolvedPath)
 
 	// Absolute paths still work
-	resolvedPath = tool.resolvePath("/etc/hosts")
-	assert.Equal(t, "/etc/hosts", resolvedPath)
+	absolutePath := filepath.Join(t.TempDir(), "hosts")
+	resolvedPath = tool.resolvePath(absolutePath)
+	assert.Equal(t, absolutePath, resolvedPath)
 }

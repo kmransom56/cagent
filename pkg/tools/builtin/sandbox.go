@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -90,6 +91,17 @@ func isProcessRunning(pid int) bool {
 	if err != nil {
 		return false
 	}
+
+	if runtime.GOOS == "windows" {
+		output, err := exec.Command("tasklist", "/FI", fmt.Sprintf("PID eq %d", pid), "/FO", "CSV", "/NH").Output()
+		if err != nil {
+			return false
+		}
+
+		result := strings.TrimSpace(string(output))
+		return result != "" && !strings.HasPrefix(result, "INFO:")
+	}
+
 	// On Unix, FindProcess always succeeds, so we need to send signal 0
 	// to check if the process actually exists
 	err = process.Signal(syscall.Signal(0))

@@ -2,7 +2,9 @@ package builtin
 
 import (
 	"encoding/json"
+	"net/url"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -304,7 +306,10 @@ func TestLSPHandler_GetDiagnostics_WithDiagnostics(t *testing.T) {
 	tool.handler.cmd = exec.Command("true")
 
 	// Manually set some diagnostics
-	tool.handler.diagnostics["file:///test.go"] = []lspDiagnostic{
+	testFile := filepath.Join(t.TempDir(), "test.go")
+	uri := pathToURI(testFile)
+
+	tool.handler.diagnostics[uri] = []lspDiagnostic{
 		{
 			Range:    lspRange{Start: lspPosition{Line: 5, Character: 0}},
 			Severity: 1,
@@ -312,10 +317,10 @@ func TestLSPHandler_GetDiagnostics_WithDiagnostics(t *testing.T) {
 		},
 	}
 	// Mark file as open to skip auto-open attempt
-	tool.handler.openFiles["file:///test.go"] = 1
+	tool.handler.openFiles[uri] = 1
 
 	ctx := t.Context()
-	result, err := tool.handler.getDiagnostics(ctx, FileArgs{File: "/test.go"})
+	result, err := tool.handler.getDiagnostics(ctx, FileArgs{File: testFile})
 	require.NoError(t, err)
 	assert.False(t, result.IsError)
 	assert.Contains(t, result.Output, "test error")
@@ -440,9 +445,20 @@ func TestLSPTool_HandlesFile(t *testing.T) {
 func TestPathToURI(t *testing.T) {
 	t.Parallel()
 
-	// Absolute path
-	uri := pathToURI("/home/user/project/main.go")
-	assert.Equal(t, "file:///home/user/project/main.go", uri)
+	path := filepath.Join(t.TempDir(), "main.go")
+	uri := pathToURI(path)
+
+	parsed, err := url.Parse(uri)
+	require.NoError(t, err)
+	assert.Equal(t, "file", parsed.Scheme)
+
+	expectedPath := filepath.ToSlash(path)
+	actualPath := parsed.Path
+	if filepath.VolumeName(path) != "" {
+		actualPath = strings.TrimPrefix(actualPath, "/")
+	}
+
+	assert.Equal(t, expectedPath, actualPath)
 }
 
 func TestLSPHandler_IsFileOpen(t *testing.T) {
