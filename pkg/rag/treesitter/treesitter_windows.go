@@ -1,8 +1,8 @@
-//go:build windows
+//go:build windows && cgo
 
 package treesitter
 
-import "github.com/docker/cagent/pkg/rag/chunk"
+import "github.com/docker/docker-agent/pkg/rag/chunk"
 
 // DocumentProcessor falls back to text chunking on Windows because the
 // go-tree-sitter dependency used for code-aware chunking is not currently
