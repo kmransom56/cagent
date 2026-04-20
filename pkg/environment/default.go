@@ -48,5 +48,10 @@ func NewDefaultProvider() Provider {
 		providers = append(providers, keychainProvider)
 	}
 
+	// Append Vault provider if VAULT_ADDR and VAULT_TOKEN are set
+	if vaultProvider := NewVaultProvider(); vaultProvider != nil {
+		providers = append(providers, vaultProvider)
+	}
+
 	return NewMultiProvider(providers...)
 }
