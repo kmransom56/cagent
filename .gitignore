@@ -16,3 +16,4 @@ vendor
 # Local environment files
 .env.local
 .claude/settings.local.json
+Untitled-1.env
