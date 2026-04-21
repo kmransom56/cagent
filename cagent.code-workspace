@@ -7,5 +7,12 @@
 			"path": "../Downloads/vault-combined"
 		}
 	],
-	"settings": {}
+	"settings": {
+		"yaml.schemas": {
+			"./agent-schema.json": [
+				"examples/**/*.yaml",
+				"*.yaml"
+			]
+		}
+	}
 }

@@ -36,6 +36,7 @@ models:
   opus:
     provider: anthropic
     model: claude-opus-4-6
+    thinking_budget: adaptive/low
   sonnet:
     provider: anthropic
     model: claude-sonnet-4-6
@@ -47,6 +48,11 @@ models:
     model: gpt-5.2
   extramax:
     model: opus,gpt
+  gemini:
+    provider: google
+    model: gemini-3.1-flash-lite-preview
+    provider_opts:
+      google_search: true
 
 agents:
   root:
@@ -94,11 +100,25 @@ agents:
       </golang_developer>
     add_date: true
     add_environment_info: true
+    skills: true
+    add_prompt_files:
+      - AGENTS.md
     toolsets:
       - type: filesystem
       - type: shell
       - type: todo
       - type: fetch
+      - type: mcp
+        command: gopls
+        args: ["mcp"]
+        version: "golang/tools@v0.21.0"
+        tools:
+          - go_workspace
+          - go_symbol_references
+          - go_search
+          - go_rename_symbol
+          - go_package_api
+          - go_file_context
     sub_agents:
       - librarian
 
@@ -109,20 +129,20 @@ agents:
       Always ask clarifying questions to ensure you fully understand the user's needs before creating the plan.
       Once you have a clear understanding, analyze the existing code and create a detailed development plan in a markdown file. Do not write any code yourself.
       Once the plan is created, you will delegate tasks to the root agent. Make sure to provide the file name of the plan when delegating. Write the plan in the current directory.
+      Use the user_prompt tool to ask questions to the user. Prefer Multiple Choice Questions.
     toolsets:
       - type: filesystem
+      - type: user_prompt
     sub_agents:
       - root
 
   librarian:
-    model: haiku
+    model: gemini
     instruction: |
       You are the librarian, your job is to look for relevant documentation to help the golang developer agent.
       When given a query, search the internet for relevant documentation, articles, or resources that can assist in completing the task.
       Use context7 for searching documentation and duckduckgo for general web searches.
     toolsets:
+      - type: fetch
       - type: mcp
         ref: docker:context7
-      - type: mcp
-        ref: docker:duckduckgo
-      - type: fetch
